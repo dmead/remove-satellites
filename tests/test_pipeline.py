@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from remote_satellites.core import pipeline, rotation, stars, video
+from remove_satellites.core import pipeline, rotation, stars, video
 
 from .synth import make_clip
 

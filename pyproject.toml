@@ -1,7 +1,7 @@
 [project]
-name = "remote-satellites"
+name = "remove-satellites"
 version = "0.1.0"
-description = "remote-satellites — remove satellite/plane trails from rotating star-field timelapses via rotation-compensated temporal median"
+description = "remove-satellites — remove satellite/plane trails from rotating star-field timelapses via rotation-compensated temporal median"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
@@ -12,11 +12,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # desktop GUI is a heavy Qt dep — the core CLI install stays lean:
-#   uv tool install 'remote-satellites[gui]'
+#   uv tool install 'remove-satellites[gui]'
 gui = ["pyside6>=6.7"]
 
 [project.scripts]
-remote-satellites = "remote_satellites.cli:main"
+remove-satellites = "remove_satellites.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8.3", "pyside6>=6.7", "pyinstaller>=6.10"]
@@ -26,10 +26,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["remote_satellites"]
+packages = ["remove_satellites"]
 
 [tool.hatch.build.targets.sdist]
-include = ["remote_satellites/**", "README.md", "pyproject.toml"]
+include = ["remove_satellites/**", "README.md", "pyproject.toml"]
 
 [tool.uv]
 

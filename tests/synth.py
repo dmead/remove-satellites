@@ -12,7 +12,7 @@ import math
 import cv2
 import numpy as np
 
-from remote_satellites.core.video import FrameWriter
+from remove_satellites.core.video import FrameWriter
 
 
 def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),

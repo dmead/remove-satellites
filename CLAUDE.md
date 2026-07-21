@@ -1,4 +1,4 @@
-# remote-satellites — trail remover for rotating star-field timelapses
+# remove-satellites — trail remover for rotating star-field timelapses
 
 Removes satellite/plane trails by rotation-compensated temporal median:
 detect the sky's rotation (pole + rate), derotate so stars are static, median
@@ -41,12 +41,12 @@ out the transient streaks, re-rotate, mux the original audio back.
 ## Layout
 
 ```
-remote_satellites/core/video.py     probe / read_frame / iter_frames / FrameWriter
-remote_satellites/core/stars.py     detect() -> [x,y,flux] intensity-weighted centroids
-remote_satellites/core/rotation.py  estimate() -> RotationModel (pole, omega, residual)
-remote_satellites/core/pipeline.py  Cleaner: .frame(i) preview, .run(out) full export
-remote_satellites/cli.py            typer: detect / clean / gui
-remote_satellites/gui/              app, window, preview (ndarray->QPixmap), worker (QThreads)
+remove_satellites/core/video.py     probe / read_frame / iter_frames / FrameWriter
+remove_satellites/core/stars.py     detect() -> [x,y,flux] intensity-weighted centroids
+remove_satellites/core/rotation.py  estimate() -> RotationModel (pole, omega, residual)
+remove_satellites/core/pipeline.py  Cleaner: .frame(i) preview, .run(out) full export
+remove_satellites/cli.py            typer: detect / clean / gui
+remove_satellites/gui/              app, window, preview (ndarray->QPixmap), worker (QThreads)
 tests/synth.py                      synthetic rotating field + moving streak
 ```
 

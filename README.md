@@ -1,10 +1,10 @@
-# remote-satellites
+# remove-satellites
 
 Remove satellite and aircraft trails from **rotating star-field timelapses**.
 
 A fixed-tripod night-sky timelapse shows the stars wheeling about the
 celestial pole. Trails (satellites, planes, meteors) are transient streaks
-that cut *across* that rotation. remote-satellites:
+that cut *across* that rotation. remove-satellites:
 
 1. **Measures** the rotation — pole location and angular rate — by matching
    star centroids across frames and fitting a rigid model (RANSAC).
@@ -23,20 +23,20 @@ Uses [uv](https://docs.astral.sh/uv/). ffmpeg must be on `PATH`.
 
 ```sh
 uv sync --extra gui        # core + desktop GUI
-uv run remote-satellites --help
+uv run remove-satellites --help
 ```
 
 ## CLI
 
 ```sh
 # inspect the detected rotation
-uv run remote-satellites detect "night.mp4"
+uv run remove-satellites detect "night.mp4"
 
 # clean a clip (auto-detects rotation; writes night_no-satellites.mp4)
-uv run remote-satellites clean "night.mp4" -r 10
+uv run remove-satellites clean "night.mp4" -r 10
 
 # manual override if auto-detect struggles (pole x,y and rad/frame)
-uv run remote-satellites clean "night.mp4" --cx 1633 --cy 763 --rate -0.000326
+uv run remove-satellites clean "night.mp4" --cx 1633 --cy 763 --rate -0.000326
 ```
 
 Key options: `-r/--radius` temporal-median half-window (bigger = stronger trail
@@ -45,7 +45,7 @@ rejection), `--crf` x264 quality, `--samples` baselines used for the fit.
 ## GUI
 
 ```sh
-uv run remote-satellites gui
+uv run remove-satellites gui
 ```
 
 Open a clip, **Auto-detect rotation** (or set the pole and total spin by hand),
@@ -60,10 +60,10 @@ stars stay pin-sharp because they are motionless during the median step.
 ## Layout
 
 ```
-remote_satellites/core/  video (OpenCV read, ffmpeg write+mux), stars (centroids),
+remove_satellites/core/  video (OpenCV read, ffmpeg write+mux), stars (centroids),
                          rotation (pole+rate fit), pipeline (derotate·median·re-rotate)
-remote_satellites/gui/   PySide6 app: window, preview, background workers
-remote_satellites/cli.py typer CLI (detect / clean / gui)
+remove_satellites/gui/   PySide6 app: window, preview, background workers
+remove_satellites/cli.py typer CLI (detect / clean / gui)
 tests/                   synthetic rotating-field fixtures (no real capture needed)
 ```
 

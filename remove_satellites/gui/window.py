@@ -1,4 +1,4 @@
-"""remote-satellites main window — open a clip, detect/adjust the sky rotation,
+"""remove-satellites main window — open a clip, detect/adjust the sky rotation,
 preview before/after, and export the trail-free video."""
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class PreviewLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self, preset_output: str | None = None):
         super().__init__()
-        self.setWindowTitle("remote-satellites — satellite-trail remover")
+        self.setWindowTitle("remove-satellites — satellite-trail remover")
         self.resize(1180, 720)
 
         self.path: str | None = None
@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
         try:
             self.info = video.probe(fn)
         except Exception as e:                                  # noqa: BLE001
-            QMessageBox.critical(self, "remote-satellites", f"Cannot open:\n{e}")
+            QMessageBox.critical(self, "remove-satellites", f"Cannot open:\n{e}")
             return
         self.path = fn
         self.model = None
@@ -272,7 +272,7 @@ class MainWindow(QMainWindow):
     def _detect_failed(self, msg: str):
         self.detect_btn.setEnabled(True)
         self.rot_status.setText("Detection failed — set the pole manually.")
-        QMessageBox.warning(self, "remote-satellites", f"Rotation detection failed:\n{msg}")
+        QMessageBox.warning(self, "remove-satellites", f"Rotation detection failed:\n{msg}")
 
     def _apply_model(self, model: RotationModel):
         self.model = model
@@ -378,7 +378,7 @@ class MainWindow(QMainWindow):
     def _export(self):
         if not (self.path and self.model):
             QMessageBox.information(
-                self, "remote-satellites",
+                self, "remove-satellites",
                 "Detect or set the sky rotation first.")
             return
         out = self.out_edit.text().strip()
@@ -420,10 +420,10 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _export_done(self, out: str):
         self._end_export()
-        QMessageBox.information(self, "remote-satellites", f"Saved:\n{out}")
+        QMessageBox.information(self, "remove-satellites", f"Saved:\n{out}")
 
     @Slot(str)
     def _export_failed(self, msg: str):
         self._end_export()
         if msg != "cancelled":
-            QMessageBox.warning(self, "remote-satellites", f"Export failed:\n{msg}")
+            QMessageBox.warning(self, "remove-satellites", f"Export failed:\n{msg}")

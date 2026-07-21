@@ -1,4 +1,4 @@
-"""remote-satellites — `clean`, `detect`, and `gui` commands."""
+"""remove-satellites — `clean`, `detect`, and `gui` commands."""
 
 from __future__ import annotations
 

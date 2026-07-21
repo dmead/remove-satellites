@@ -1,6 +1,6 @@
 import math
 
-from remote_satellites.core import rotation
+from remove_satellites.core import rotation
 
 from .synth import make_clip
 
