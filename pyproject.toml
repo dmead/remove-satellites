@@ -1,0 +1,37 @@
+[project]
+name = "remote-satellites"
+version = "0.1.0"
+description = "remote-satellites — remove satellite/plane trails from rotating star-field timelapses via rotation-compensated temporal median"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "scipy>=1.14",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+# desktop GUI is a heavy Qt dep — the core CLI install stays lean:
+#   uv tool install 'remote-satellites[gui]'
+gui = ["pyside6>=6.7"]
+
+[project.scripts]
+remote-satellites = "remote_satellites.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pyside6>=6.7", "pyinstaller>=6.10"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["remote_satellites"]
+
+[tool.hatch.build.targets.sdist]
+include = ["remote_satellites/**", "README.md", "pyproject.toml"]
+
+[tool.uv]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

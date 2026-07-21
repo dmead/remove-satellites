@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.spec
+out/
+/scratch/
+
+# capture data — never commit real footage/frames unless explicitly approved
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mxf
+*.ser
+*.fits
+*.fit
+*.xisf
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+/data/
+/samples/
