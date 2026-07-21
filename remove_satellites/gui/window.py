@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QProgressBar, QPushButton, QSizePolicy, QSlider,
-                               QSpinBox, QVBoxLayout, QWidget)
+                               QSpinBox, QStyle, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from ..core import rotation, video
 from ..core.rotation import RotationModel
@@ -62,8 +63,13 @@ class MainWindow(QMainWindow):
         self._worker = None                 # keep refs so QThreads aren't GC'd
         self._raw_frame = None
         self._clean_cache: dict[int, object] = {}
+        self._playing = False
 
         self._build_ui()
+
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+
         self._set_enabled(False)
 
     # ---- UI construction ------------------------------------------------
@@ -78,6 +84,24 @@ class MainWindow(QMainWindow):
         left.addWidget(self.preview, 1)
 
         viewrow = QHBoxLayout()
+
+        def _icon(sp):
+            return self.style().standardIcon(sp)
+
+        self.rewind_btn = QToolButton()
+        self.rewind_btn.setIcon(_icon(QStyle.StandardPixmap.SP_MediaSkipBackward))
+        self.rewind_btn.setToolTip("Rewind to start")
+        self.rewind_btn.clicked.connect(self._rewind)
+        self.play_btn = QToolButton()
+        self._play_icon = _icon(QStyle.StandardPixmap.SP_MediaPlay)
+        self._pause_icon = _icon(QStyle.StandardPixmap.SP_MediaPause)
+        self.play_btn.setIcon(self._play_icon)
+        self.play_btn.setToolTip("Play / pause")
+        self.play_btn.clicked.connect(self._toggle_play)
+        viewrow.addWidget(self.rewind_btn)
+        viewrow.addWidget(self.play_btn)
+        viewrow.addSpacing(12)
+
         self.before_btn = QPushButton("Before")
         self.after_btn = QPushButton("After")
         for b in (self.before_btn, self.after_btn):
@@ -217,7 +241,8 @@ class MainWindow(QMainWindow):
     def _set_enabled(self, on: bool):
         for w in (self.detect_btn, self.cx_spin, self.cy_spin, self.total_spin,
                   self.radius, self.export_btn, self.scrub, self.frame_spin,
-                  self.before_btn, self.after_btn):
+                  self.before_btn, self.after_btn, self.play_btn,
+                  self.rewind_btn):
             w.setEnabled(on)
 
     def _open(self):
@@ -226,6 +251,7 @@ class MainWindow(QMainWindow):
             "Video (*.mp4 *.mov *.avi *.mkv);;All files (*)")
         if not fn:
             return
+        self._stop_play()
         try:
             self.info = video.probe(fn)
         except Exception as e:                                  # noqa: BLE001
@@ -307,7 +333,40 @@ class MainWindow(QMainWindow):
         self.frame_spin.setValue(v)
         self.frame_spin.blockSignals(False)
         self._raw_frame = None
-        self._debounce.start()
+        if self._playing:
+            self._show_raw()            # immediate raw draw keeps playback smooth
+        else:
+            self._debounce.start()
+
+    # ---- playback -------------------------------------------------------
+    def _toggle_play(self):
+        self._stop_play() if self._playing else self._start_play()
+
+    def _start_play(self):
+        if not self.path:
+            return
+        self._set_view(False)           # play the raw frames (cleaning is too slow)
+        self._playing = True
+        self.play_btn.setIcon(self._pause_icon)
+        if self.scrub.value() >= self.scrub.maximum():
+            self.scrub.setValue(0)
+        fps = self.info.fps if self.info and self.info.fps else 24.0
+        self._play_timer.start(int(1000 / max(1.0, fps)))
+
+    def _stop_play(self):
+        self._playing = False
+        self._play_timer.stop()
+        self.play_btn.setIcon(self._play_icon)
+
+    def _play_tick(self):
+        v = self.scrub.value() + 1
+        if v > self.scrub.maximum():
+            v = 0                       # loop
+        self.scrub.setValue(v)
+
+    def _rewind(self):
+        self._stop_play()
+        self.scrub.setValue(0)
 
     def _on_radius(self, v: int):
         self.radius_lbl.setText(str(v))
@@ -316,6 +375,8 @@ class MainWindow(QMainWindow):
             self._debounce.start()
 
     def _set_view(self, after: bool):
+        if after and self._playing:
+            self._stop_play()           # After is computed per-frame; pause first
         self.before_btn.setChecked(not after)
         self.after_btn.setChecked(after)
         self._refresh_preview()
@@ -381,6 +442,7 @@ class MainWindow(QMainWindow):
                 self, "remove-satellites",
                 "Detect or set the sky rotation first.")
             return
+        self._stop_play()
         out = self.out_edit.text().strip()
         if not out:
             self._pick_output()
