@@ -4,6 +4,9 @@ Removes satellite/plane trails by rotation-compensated temporal median:
 detect the sky's rotation (pole + rate), derotate so stars are static, median
 out the transient streaks, re-rotate, mux the original audio back.
 
+Parked ideas and a known limitation (off-frame / near-equatorial pole; trail
+annotation) live in `docs/ROADMAP.md`.
+
 ## Environment
 
 - **No system Python.** `python` on PATH is the WindowsApps stub. Everything

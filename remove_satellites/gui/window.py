@@ -4,6 +4,9 @@ preview before/after, and export the trail-free video."""
 from __future__ import annotations
 
 import math
+import os
+import shutil
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -61,9 +64,14 @@ class MainWindow(QMainWindow):
         self.preset_output = preset_output
 
         self._worker = None                 # keep refs so QThreads aren't GC'd
-        self._raw_frame = None
+        self._job = None                     # currently running cancellable render
         self._clean_cache: dict[int, object] = {}
         self._playing = False
+        # a fully-rendered cleaned copy for smooth After playback
+        self._clean_video: str | None = None
+        self._clean_key = None
+        self._pending_clean = None           # (tmp, key, then_play)
+        self._tmpdir = tempfile.mkdtemp(prefix="remove-sat-")
 
         self._build_ui()
 
@@ -259,7 +267,7 @@ class MainWindow(QMainWindow):
             return
         self.path = fn
         self.model = None
-        self._clean_cache.clear()
+        self._invalidate_clean()
         n = self.info.frame_count
         self.scrub.setRange(0, n - 1)
         self.frame_spin.setRange(0, n - 1)
@@ -273,7 +281,7 @@ class MainWindow(QMainWindow):
         self.out_edit.setText(default_out)
         self._set_enabled(True)
         self.rot_status.setText("Run auto-detect (or set the pole manually).")
-        self._show_raw()
+        self._display()
 
     # ---- rotation -------------------------------------------------------
     def _detect(self):
@@ -302,7 +310,7 @@ class MainWindow(QMainWindow):
 
     def _apply_model(self, model: RotationModel):
         self.model = model
-        self._clean_cache.clear()
+        self._invalidate_clean()
         block = (self.cx_spin, self.cy_spin, self.total_spin)
         for w in block:
             w.blockSignals(True)
@@ -323,7 +331,7 @@ class MainWindow(QMainWindow):
             center=(self.cx_spin.value(), self.cy_spin.value()),
             omega=omega, ref_index=0, n_frames=n,
             residual_px=float("nan"), n_pairs=0)
-        self._clean_cache.clear()
+        self._invalidate_clean()
         self.rot_status.setText("manual rotation")
         self._refresh_preview()
 
@@ -332,11 +340,55 @@ class MainWindow(QMainWindow):
         self.frame_spin.blockSignals(True)
         self.frame_spin.setValue(v)
         self.frame_spin.blockSignals(False)
-        self._raw_frame = None
-        if self._playing:
-            self._show_raw()            # immediate raw draw keeps playback smooth
+        # fast paths (raw, or a pre-rendered cleaned clip) draw immediately;
+        # the slow on-demand single-frame clean is debounced while scrubbing
+        if self._playing or not self.after_btn.isChecked() \
+                or self._clean_video_valid():
+            self._display(v)
         else:
             self._debounce.start()
+
+    def _blit(self, frame):
+        pm = preview.bgr_to_pixmap(frame)
+        if self.show_pole.isChecked() and self.model:
+            pm = preview.draw_pole(pm, self.model.center)
+        self.preview.set_source(pm)
+
+    def _display(self, idx: int | None = None):
+        """Show the right frame for the current view (Before / After)."""
+        if not self.path:
+            return
+        if idx is None:
+            idx = self.scrub.value()
+        after = self.after_btn.isChecked()
+        if after and self.model and self._clean_video_valid():
+            self._blit(video.read_frame(self._clean_video, idx))
+        elif after and self.model:
+            cached = self._clean_cache.get(idx)
+            if cached is not None:
+                self._blit(cached)
+            else:                       # slow one-off clean of this frame
+                self.rot_status_busy("cleaning preview frame…")
+                self._worker = FrameWorker(self.path, self.model,
+                                           self.radius.value(), idx)
+                self._worker.done.connect(self._frame_ready)
+                self._worker.failed.connect(lambda m: self.rot_status_busy(""))
+                self._worker.start()
+        else:
+            self._blit(video.read_frame(self.path, idx))
+
+    def _refresh_preview(self):
+        self._display()
+
+    def rot_status_busy(self, msg):
+        self.statusBar().showMessage(msg) if msg else self.statusBar().clearMessage()
+
+    @Slot(int, object)
+    def _frame_ready(self, idx: int, frame):
+        self.rot_status_busy("")
+        self._clean_cache[idx] = frame
+        if self.after_btn.isChecked() and self.scrub.value() == idx:
+            self._blit(frame)
 
     # ---- playback -------------------------------------------------------
     def _toggle_play(self):
@@ -345,7 +397,13 @@ class MainWindow(QMainWindow):
     def _start_play(self):
         if not self.path:
             return
-        self._set_view(False)           # play the raw frames (cleaning is too slow)
+        # After playback needs a fully-rendered cleaned clip; render it once
+        if self.after_btn.isChecked() and self.model and not self._clean_video_valid():
+            self._render_clean(then_play=True)
+            return
+        self._begin_play()
+
+    def _begin_play(self):
         self._playing = True
         self.play_btn.setIcon(self._pause_icon)
         if self.scrub.value() >= self.scrub.maximum():
@@ -370,64 +428,66 @@ class MainWindow(QMainWindow):
 
     def _on_radius(self, v: int):
         self.radius_lbl.setText(str(v))
-        self._clean_cache.clear()
+        self._invalidate_clean()
         if self.after_btn.isChecked():
             self._debounce.start()
 
     def _set_view(self, after: bool):
-        if after and self._playing:
-            self._stop_play()           # After is computed per-frame; pause first
         self.before_btn.setChecked(not after)
         self.after_btn.setChecked(after)
-        self._refresh_preview()
+        self._display()
 
-    def _show_raw(self):
-        if not self.path:
-            return
-        idx = self.scrub.value()
-        if self._raw_frame is None:
-            self._raw_frame = video.read_frame(self.path, idx)
-        pm = preview.bgr_to_pixmap(self._raw_frame)
-        if self.show_pole.isChecked() and self.model:
-            pm = preview.draw_pole(pm, self.model.center)
-        self.preview.set_source(pm)
+    # ---- cleaned-clip cache for After playback --------------------------
+    def _settings_key(self):
+        m = self.model
+        return (round(m.center[0], 2), round(m.center[1], 2),
+                round(m.omega, 9), self.radius.value()) if m else None
 
-    def _refresh_preview(self):
-        if not self.path:
-            return
-        if self.after_btn.isChecked() and self.model:
-            idx = self.scrub.value()
-            cached = self._clean_cache.get(idx)
-            if cached is not None:
-                pm = preview.bgr_to_pixmap(cached)
-                if self.show_pole.isChecked():
-                    pm = preview.draw_pole(pm, self.model.center)
-                self.preview.set_source(pm)
-            else:
-                self.rot_status_busy("cleaning preview frame…")
-                self._worker = FrameWorker(self.path, self.model,
-                                           self.radius.value(), idx)
-                self._worker.done.connect(self._frame_ready)
-                self._worker.failed.connect(lambda m: self.rot_status_busy(""))
-                self._worker.start()
-        else:
-            self._show_raw()
+    def _clean_video_valid(self) -> bool:
+        return bool(self._clean_video and self.model
+                    and self._clean_key == self._settings_key()
+                    and os.path.exists(self._clean_video))
 
-    def rot_status_busy(self, msg):
-        if msg:
-            self.statusBar().showMessage(msg)
-        else:
-            self.statusBar().clearMessage()
+    def _invalidate_clean(self):
+        self._clean_cache.clear()
+        if self._playing and self.after_btn.isChecked():
+            self._stop_play()
+        if self._clean_video and os.path.exists(self._clean_video):
+            try:
+                os.remove(self._clean_video)
+            except OSError:
+                pass
+        self._clean_video = None
+        self._clean_key = None
 
-    @Slot(int, object)
-    def _frame_ready(self, idx: int, frame):
-        self.rot_status_busy("")
-        self._clean_cache[idx] = frame
-        if self.after_btn.isChecked() and self.scrub.value() == idx:
-            pm = preview.bgr_to_pixmap(frame)
-            if self.show_pole.isChecked() and self.model:
-                pm = preview.draw_pole(pm, self.model.center)
-            self.preview.set_source(pm)
+    def _render_clean(self, *, then_play: bool):
+        tmp = os.path.join(self._tmpdir, f"clean_{abs(hash(self._settings_key()))}.mp4")
+        self._pending_clean = (tmp, self._settings_key(), then_play)
+        self._begin_progress("Rendering cleaned preview…")
+        self._job = ExportWorker(self.path, self.model, self.radius.value(),
+                                 tmp, crf=18)
+        self._job.progress.connect(self._export_progress)
+        self._job.done.connect(self._clean_ready)
+        self._job.failed.connect(self._clean_failed)
+        self._job.start()
+
+    @Slot(str)
+    def _clean_ready(self, out: str):
+        self._end_progress()
+        tmp, key, then_play = self._pending_clean
+        self._pending_clean = None
+        self._clean_video, self._clean_key = tmp, key
+        self._display()
+        if then_play:
+            self._begin_play()
+
+    @Slot(str)
+    def _clean_failed(self, msg: str):
+        self._end_progress()
+        self._pending_clean = None
+        if msg != "cancelled":
+            QMessageBox.warning(self, "remove-satellites",
+                                f"Preview render failed:\n{msg}")
 
     # ---- export ---------------------------------------------------------
     def _pick_output(self):
@@ -449,18 +509,35 @@ class MainWindow(QMainWindow):
             out = self.out_edit.text().strip()
             if not out:
                 return
-        self.export_btn.setEnabled(False)
-        self.open_btn.setEnabled(False)
+        self._begin_progress("Exporting cleaned video…")
+        self._job = ExportWorker(self.path, self.model, self.radius.value(),
+                                 out, crf=self.crf.currentData())
+        self._job.progress.connect(self._export_progress)
+        self._job.done.connect(self._export_done)
+        self._job.failed.connect(self._export_failed)
+        self._job.start()
+
+    # ---- shared progress UI (export + preview render) -------------------
+    _BUSY_WIDGETS = ("export_btn", "open_btn", "play_btn", "detect_btn",
+                     "cx_spin", "cy_spin", "total_spin", "radius")
+
+    def _begin_progress(self, label: str):
+        self.rot_status_busy(label)
         self.progress.setValue(0)
         self.progress.setMaximum(self.info.frame_count)
         self.progress.setVisible(True)
         self.cancel_btn.setVisible(True)
-        self._worker = ExportWorker(self.path, self.model, self.radius.value(),
-                                    out, crf=self.crf.currentData())
-        self._worker.progress.connect(self._export_progress)
-        self._worker.done.connect(self._export_done)
-        self._worker.failed.connect(self._export_failed)
-        self._worker.start()
+        self.cancel_btn.setEnabled(True)
+        for name in self._BUSY_WIDGETS:
+            getattr(self, name).setEnabled(False)
+
+    def _end_progress(self):
+        self.rot_status_busy("")
+        self.progress.setVisible(False)
+        self.cancel_btn.setVisible(False)
+        for name in self._BUSY_WIDGETS:
+            getattr(self, name).setEnabled(True)
+        self._job = None
 
     @Slot(int, int)
     def _export_progress(self, k: int, n: int):
@@ -468,24 +545,25 @@ class MainWindow(QMainWindow):
         self.progress.setValue(k)
 
     def _cancel_export(self):
-        if isinstance(self._worker, ExportWorker):
-            self._worker.cancel()
+        if self._job is not None:
+            self._job.cancel()
             self.cancel_btn.setEnabled(False)
-
-    def _end_export(self):
-        self.progress.setVisible(False)
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.setEnabled(True)
-        self.export_btn.setEnabled(True)
-        self.open_btn.setEnabled(True)
 
     @Slot(str)
     def _export_done(self, out: str):
-        self._end_export()
+        self._end_progress()
         QMessageBox.information(self, "remove-satellites", f"Saved:\n{out}")
 
     @Slot(str)
     def _export_failed(self, msg: str):
-        self._end_export()
+        self._end_progress()
         if msg != "cancelled":
             QMessageBox.warning(self, "remove-satellites", f"Export failed:\n{msg}")
+
+    def closeEvent(self, ev):
+        self._stop_play()
+        if self._job is not None:
+            self._job.cancel()
+            self._job.wait(2000)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        super().closeEvent(ev)
