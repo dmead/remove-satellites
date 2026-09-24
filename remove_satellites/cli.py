@@ -13,20 +13,33 @@ def _default_out(inp: Path) -> Path:
     return inp.with_name(inp.stem + "_no-satellites.mp4")
 
 
+def _load_or_track(input: Path, track_path: Path | None):
+    """Sky-motion track, cached next to the clip (tracking 4K is slow)."""
+    from .core import track
+
+    cache = track_path or track.default_cache(input)
+    typer.echo(f"using cached track {cache}" if cache.exists()
+               else "tracking sky motion...")
+    return track.load_or_estimate(input, cache)[0]
+
+
+def _describe(tr, w: int, h: int) -> None:
+    from .core import track
+
+    typer.echo("  " + track.summary(tr, w, h))
+
+
 @app.command()
 def detect(
     input: Path = typer.Argument(..., exists=True, dir_okay=False),
-    ref: int = typer.Option(0, help="reference frame index"),
-    samples: int = typer.Option(25, help="baselines sampled across the clip"),
+    track_path: Path = typer.Option(None, "--track",
+                                    help="track cache (.npz)"),
 ):
-    """Print the auto-detected sky rotation (pole + rate) for a clip."""
-    from .core import rotation
+    """Track the sky motion of a clip and summarise it."""
+    from .core import video
 
-    m = rotation.estimate(input, ref_index=ref, samples=samples)
-    typer.echo(f"center      : ({m.center[0]:.1f}, {m.center[1]:.1f}) px")
-    typer.echo(f"rate        : {m.omega:.6f} rad/frame")
-    typer.echo(f"total       : {m.total_deg:.2f} deg over {m.n_frames} frames")
-    typer.echo(f"residual    : {m.residual_px:.2f} px  ({m.n_pairs} baselines)")
+    info = video.probe(input)
+    _describe(_load_or_track(input, track_path), info.width, info.height)
 
 
 @app.command()
@@ -36,30 +49,40 @@ def clean(
     radius: int = typer.Option(10, "--radius", "-r",
                                help="temporal median half-window (frames)"),
     crf: int = typer.Option(16, help="x264 quality (lower = better)"),
-    ref: int = typer.Option(0, help="reference frame for rotation fit"),
-    samples: int = typer.Option(25, help="baselines sampled across the clip"),
-    cx: float = typer.Option(None, help="override pole x (skips detection)"),
+    track_path: Path = typer.Option(None, "--track",
+                                    help="track cache (.npz)"),
+    foreground: bool = typer.Option(True, help="detect and protect "
+                                    "camera-fixed foreground (land, trees)"),
+    ref: int = typer.Option(0, help="reference frame for manual override"),
+    cx: float = typer.Option(None, help="override pole x (skips tracking)"),
     cy: float = typer.Option(None, help="override pole y"),
     rate: float = typer.Option(None, help="override rate (rad/frame)"),
 ):
-    """Remove satellite/plane trails from a rotating star-field timelapse."""
-    from .core import pipeline, rotation, video
+    """Remove satellite/plane trails from a star-field timelapse."""
+    from .core import foreground as fgmod
+    from .core import pipeline, rotation, track, video
 
     output = output or _default_out(input)
+    info = video.probe(input)
 
     if cx is not None and cy is not None and rate is not None:
-        info = video.probe(input)
         model = rotation.RotationModel(
             center=(cx, cy), omega=rate, ref_index=ref,
             n_frames=info.frame_count, residual_px=float("nan"), n_pairs=0)
+        sign = pipeline._calibrate_sign(input, model, info.frame_count // 2)
+        tr = track.Track.from_rotation(model, sign)
         typer.echo("using manual rotation override")
     else:
-        typer.echo("detecting sky rotation...")
-        model = rotation.estimate(input, ref_index=ref, samples=samples)
-        typer.echo(f"  pole ({model.center[0]:.0f},{model.center[1]:.0f}), "
-                   f"{model.total_deg:.2f} deg, residual {model.residual_px:.2f}px")
+        tr = _load_or_track(input, track_path)
+        _describe(tr, info.width, info.height)
 
-    cleaner = pipeline.Cleaner(input, model, radius=radius)
+    mask = None
+    if foreground:
+        typer.echo("finding foreground...")
+        mask = fgmod.static_mask(input, tr)
+        typer.echo(f"  {100 * mask.mean():.1f}% of the frame is foreground")
+
+    cleaner = pipeline.Cleaner(input, tr, radius=radius, fg_mask=mask)
     n = cleaner.info.frame_count
 
     with typer.progressbar(length=n, label="cleaning") as bar:

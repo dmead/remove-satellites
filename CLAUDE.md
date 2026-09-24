@@ -1,11 +1,13 @@
-# remove-satellites — trail remover for rotating star-field timelapses
+# remove-satellites — trail remover for star-field timelapses
 
-Removes satellite/plane trails by rotation-compensated temporal median:
-detect the sky's rotation (pole + rate), derotate so stars are static, median
-out the transient streaks, re-rotate, mux the original audio back.
+Removes satellite/plane trails by star-aligned temporal median: track the
+sky's frame-to-frame motion (homographies), warp each median window's
+neighbours onto its centre frame so stars are static, median out the
+transient streaks, give camera-fixed foreground a plain median, mux the
+original audio back.
 
-Parked ideas and a known limitation (off-frame / near-equatorial pole; trail
-annotation) live in `docs/ROADMAP.md`.
+Parked ideas (trail annotation) live in
+`docs/ROADMAP.md`.
 
 ## Environment
 
@@ -20,20 +22,29 @@ annotation) live in `docs/ROADMAP.md`.
 
 ## Design invariants (locked by tests — change test + code together)
 
-- **Rotation model**: `angle(k) = omega * (k - ref_index)` radians, linear in
-  frame index; `RotationModel` is immutable. `rotation.estimate` fits it from
-  star centroids via `cv2.estimateAffinePartial2D` (RANSAC) over several
-  baselines; pole = fixed point of each transform, rate = weighted LS slope.
-- **Pipeline aligns to the clip middle** (`Cleaner.ref_index = n//2`) via
-  `Cleaner._angle_deg`, *not* to `model.ref_index` — this halves the max
-  derotation and therefore the canvas padding (`_auto_pad`). Keep derotate and
-  re-rotate using the *same* `_angle_deg` so they invert exactly.
-- **Sign convention is calibrated, not assumed**: `_calibrate_sign` rotates the
-  farthest frame's star points both ways and keeps the one that better matches
-  the reference. Don't hard-code a sign.
-- **All warps use `cv2.getRotationMatrix2D` + `warpAffine`** on a canvas padded
-  by `pad` so no corner is clipped; output is re-rotated then cropped back to
-  the source size. Points and images must use the *same* matrix convention.
+- **Star detection subtracts a local background** (`stars.background`, a
+  median at 1/8 scale) before thresholding. A global threshold fails on any
+  frame with horizon glow (mono_east: threshold 323 on 8-bit data).
+- **Sky motion is a chain of homographies** (`track.Track`, `steps[k]`: frame
+  k → k+1), not a pole + rate. It covers far-off-frame poles (pure pan) and
+  wide-angle projection, where the apparent rotation/scale drift over a clip.
+  `Track.between(src, dst)` composes steps; backwards it must undo step
+  `src-1` first (order matters — homographies don't commute).
+- **Tracking fits the movers**: `_step` drops points that moved < 0.3 px when
+  enough moved, so a static foreground can't win RANSAC with an identity fit.
+  `finalize` rejects steps whose motion is > 25% off the clip median
+  (washed-out frames lock onto the foreground) and gap-fills them.
+- **Each median window is aligned to its own centre frame** — no global
+  derotation, canvas padding or re-rotation. Only ≤ 2r chained steps are
+  ever composed, so chaining drift stays sub-pixel.
+- **Foreground mask** (`foreground.static_mask`): per-pixel vote of raw vs
+  sky-aligned difference on background-subtracted frames, closed, then
+  everything unreachable from the top edge through sky is foreground.
+  Foreground gets a plain median; aligned samples landing on foreground or
+  off-frame are excluded from the sky median by filling them alternately with
+  0/255 (balanced fills leave the middle rank on the valid samples).
+- **Sign convention is calibrated, not assumed** for the legacy pole + rate
+  model (`_calibrate_sign`, then `Track.from_rotation`). Don't hard-code it.
 - **Median is the hot loop**: `_median_u8` splits rows across `_NTHREADS`
   threads (numpy partition releases the GIL) and takes the middle rank. Don't
   replace with a single-threaded `np.median` — it's ~5× slower here.
@@ -44,13 +55,15 @@ annotation) live in `docs/ROADMAP.md`.
 ## Layout
 
 ```
-remove_satellites/core/video.py     probe / read_frame / iter_frames / FrameWriter
-remove_satellites/core/stars.py     detect() -> [x,y,flux] intensity-weighted centroids
-remove_satellites/core/rotation.py  estimate() -> RotationModel (pole, omega, residual)
-remove_satellites/core/pipeline.py  Cleaner: .frame(i) preview, .run(out) full export
-remove_satellites/cli.py            typer: detect / clean / gui
-remove_satellites/gui/              app, window, preview (ndarray->QPixmap), worker (QThreads)
-tests/synth.py                      synthetic rotating field + moving streak
+remove_satellites/core/video.py       probe / read_frame / iter_frames / FrameWriter
+remove_satellites/core/stars.py       background() / detect() -> [x,y,flux] centroids
+remove_satellites/core/track.py       estimate() -> Track (per-step homographies)
+remove_satellites/core/foreground.py  static_mask() -> camera-fixed pixels
+remove_satellites/core/rotation.py    legacy pole + rate fit (GUI manual controls)
+remove_satellites/core/pipeline.py    Cleaner: .frame(i) preview, .run(out) full export
+remove_satellites/cli.py              typer: detect / clean / gui (track cached as <clip>.track.npz)
+remove_satellites/gui/                app, window, preview, worker — still pole + rate based
+tests/synth.py                        synthetic field: rotation, drift (pan), ground, streak
 ```
 
 ## Data policy

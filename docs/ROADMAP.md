@@ -1,11 +1,16 @@
 # Roadmap / deferred work
 
-Parked ideas and known limitations, captured so they aren't lost. Nothing here
-is implemented yet.
+Parked ideas and known limitations, captured so they aren't lost.
 
-## 1. Off-frame pole robustness (known limitation)
+## 1. Off-frame pole robustness — DONE (2026-09)
 
-**Current behaviour.** `rotation.estimate` fits a *pure rotation about a pole*
+Implemented as `core/track.py`: per-step homographies instead of pole + rate,
+with each median window aligned to its own centre frame. Prompted by
+`mono_east` (east-facing, 4K, wide-angle), whose apparent per-frame rotation
+and scale drifted across the clip — not even a similarity. Kept below for
+history.
+
+**Behaviour before the fix.** `rotation.estimate` fits a *pure rotation about a pole*
 (a single `center` + `omega`). This works when the pole is in the frame **or**
 off-frame, as long as the star trails are still visibly curved.
 

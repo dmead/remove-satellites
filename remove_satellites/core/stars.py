@@ -17,16 +17,33 @@ def to_gray(frame: np.ndarray) -> np.ndarray:
     return frame
 
 
+def background(gray: np.ndarray, *, scale: int = 8, ksize: int = 7
+               ) -> np.ndarray:
+    """Smooth sky background: median of a downsampled copy, scaled back up.
+
+    Median-filtering at 1/`scale` resolution spans ~scale*ksize full-res
+    pixels — wide enough to ignore stars, narrow enough to follow horizon glow
+    and light pollution gradients. Downsampling keeps it cheap at 4K.
+    """
+    h, w = gray.shape
+    small = cv2.resize(gray, (max(1, w // scale), max(1, h // scale)),
+                       interpolation=cv2.INTER_AREA)
+    small = cv2.medianBlur(small.astype(np.uint8), ksize).astype(np.float32)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def detect(frame: np.ndarray, *, max_stars: int = 120,
            k_sigma: float = 6.0, min_area: int = 2,
            max_area: int = 400) -> np.ndarray:
     """Return an (N, 3) array of [x, y, flux], brightest first.
 
-    Threshold at median + k_sigma * MAD-sigma, label blobs, keep compact ones,
-    take intensity-weighted centroids. Robust background stats make it work on
-    both the dark sky and the letterbox bars (which contribute no blobs).
+    Subtract a local background, threshold the residual at
+    median + k_sigma * MAD-sigma, label blobs, keep compact ones, take
+    intensity-weighted centroids. The local background matters: a global
+    threshold on a frame with horizon glow sits above every star.
     """
     gray = to_gray(frame).astype(np.float32)
+    gray = gray - background(gray)
     med = float(np.median(gray))
     mad = float(np.median(np.abs(gray - med))) or 1.0
     sigma = 1.4826 * mad

@@ -1,10 +1,18 @@
-"""The cleaning pipeline: derotate → temporal median → re-rotate.
+"""The cleaning pipeline: per-window star alignment → temporal median.
 
-All frames are warped onto a padded canvas whose centre is the pole, so the
-rotation loses no corner content. With the stars held still by derotation, a
-sliding temporal median rejects transient streaks (satellites, planes) while
-leaving the stars untouched; each median frame is then re-rotated back to its
-original orientation and cropped to the source size.
+For each output frame c, the 2r neighbours are warped onto c's own geometry
+with the sky-motion homography between them (`Track.between`), so the stars
+stand still across the window and a per-pixel median rejects the transient
+streaks (satellites, planes) without smearing a star. Aligning each window to
+its own centre means no global derotation, no canvas padding and no second
+re-rotation interpolation, and it works for any pole position — including
+far off-frame, where the sky motion is near-translation and lens projection
+makes it anything but a rigid rotation.
+
+Camera-fixed foreground (`foreground.static_mask`) would smear under star
+alignment, so it gets a plain (unaligned) median instead, and aligned samples
+that land on foreground or outside the neighbour's frame are excluded from
+the sky median.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from scipy.spatial import cKDTree
 
 from . import stars, video
 from .rotation import RotationModel
+from .track import Track
 
 _NTHREADS = min(os.cpu_count() or 4, 16)
 
@@ -32,17 +41,8 @@ def _rot_matrix(center, angle_deg, tx=0.0, ty=0.0):
     return m
 
 
-def _auto_pad(model: RotationModel, w: int, h: int, ref_index: int) -> int:
-    cx, cy = model.center
-    amax = max(abs(model.omega * (0 - ref_index)),
-               abs(model.omega * (model.n_frames - 1 - ref_index)))
-    rmax = max(math.hypot(x - cx, y - cy)
-               for x, y in [(0, 0), (w, 0), (0, h), (w, h)])
-    return int(rmax * abs(math.sin(amax))) + 8
-
-
 def _calibrate_sign(path, model: RotationModel, ref_index: int) -> float:
-    """Return +1/-1 so that derotation actually undoes the measured rotation.
+    """Return +1/-1 so that the rotation model's sense matches the sky.
 
     Sign-convention insurance: rotate the farthest frame's star points both
     ways and keep whichever better matches the reference frame's stars.
@@ -92,105 +92,98 @@ def _median_u8(buf: list[np.ndarray], executor: ThreadPoolExecutor | None = None
 
 
 class Cleaner:
-    """Reusable engine for both full-clip export and single-frame preview."""
+    """Reusable engine for both full-clip export and single-frame preview.
 
-    def __init__(self, path, model: RotationModel, *, radius: int = 8,
-                 ref_index: int | None = None, pad: int | None = None):
+    `motion` is a `Track` (per-step homographies) or a `RotationModel` (pole +
+    rate, converted to a uniform track). `fg_mask` (1 = camera-fixed
+    foreground) is optional; without it every pixel is treated as sky.
+    """
+
+    def __init__(self, path, motion: Track | RotationModel, *,
+                 radius: int = 8, fg_mask: np.ndarray | None = None):
         self.path = path
         self.info = video.probe(path)
-        self.model = model
         self.radius = int(radius)
-        self.ref_index = (self.info.frame_count // 2
-                          if ref_index is None else int(ref_index))
-        self.pad = _auto_pad(model, self.info.width, self.info.height,
-                             self.ref_index) if pad is None else int(pad)
-        self.sign = _calibrate_sign(path, model, self.ref_index)
-        self._cw = self.info.width + 2 * self.pad
-        self._ch = self.info.height + 2 * self.pad
+        if isinstance(motion, RotationModel):
+            sign = _calibrate_sign(path, motion, self.info.frame_count // 2)
+            motion = Track.from_rotation(motion, sign)
+        self.track = motion
+        self.fg = None if fg_mask is None or not fg_mask.any() else \
+            fg_mask.astype(np.uint8)
+        if self.fg is not None:
+            rows = np.flatnonzero(self.fg.any(axis=1))
+            self._fg_rows = slice(int(rows[0]), int(rows[-1]) + 1)
+            soft = cv2.GaussianBlur(self.fg.astype(np.float32), (0, 0), 2.0)
+            self._fg_alpha = soft[self._fg_rows, :, None]
 
-    def _angle_deg(self, k: int) -> float:
-        # align to the clip's middle (self.ref_index) so the max derotation —
-        # and thus the canvas padding — is half of the full sweep
-        return math.degrees(self.model.omega * (k - self.ref_index))
+    def _aligned(self, frame: np.ndarray, src: int, dst: int) -> np.ndarray:
+        """Frame `src` warped onto frame `dst`; excluded samples get 0/255.
 
-    def _derotate(self, frame, k) -> np.ndarray:
-        ang = self.sign * -self._angle_deg(k)
-        m = _rot_matrix(self.model.center, ang, self.pad, self.pad)
-        return cv2.warpAffine(frame, m, (self._cw, self._ch),
-                              flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+        The median can't take per-pixel sample counts, so invalid samples are
+        filled alternately with 0 and 255 by frame parity: equal numbers of
+        each below and above leave the middle rank on the valid samples.
+        """
+        w, h = self.info.width, self.info.height
+        H = self.track.between(src, dst)
+        out = cv2.warpPerspective(frame, H, (w, h), flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=(0, 0, 0))
+        src_ok = np.ones((h, w), np.uint8) if self.fg is None else 1 - self.fg
+        ok = cv2.warpPerspective(src_ok, H, (w, h), flags=cv2.INTER_NEAREST,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        out[ok == 0] = 0 if (src - dst) % 2 == 0 else 255
+        return out
 
-    def _rerotate_crop(self, canvas, k) -> np.ndarray:
-        ang = self.sign * self._angle_deg(k)
-        pc = (self.model.center[0] + self.pad, self.model.center[1] + self.pad)
-        m = _rot_matrix(pc, ang)
-        out = cv2.warpAffine(canvas, m, (self._cw, self._ch),
-                             flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
-        p = self.pad
-        return out[p:p + self.info.height, p:p + self.info.width]
+    def _combine(self, center: int, raw: dict[int, np.ndarray],
+                 ex: ThreadPoolExecutor) -> np.ndarray:
+        """Median of the window around `center` from its raw frames."""
+        keys = sorted(raw)
+        warped = list(ex.map(
+            lambda k: raw[k] if k == center else
+            self._aligned(raw[k], k, center), keys))
+        sky = _median_u8(warped, ex)
+        if self.fg is None:
+            return sky
+        rs = self._fg_rows
+        plain = _median_u8([raw[k][rs] for k in keys], ex)
+        a = self._fg_alpha
+        sky[rs] = (a * plain + (1.0 - a) * sky[rs] + 0.5).astype(np.uint8)
+        return sky
 
     def frame(self, index: int) -> np.ndarray:
         """Cleaned single frame (processes just its median window)."""
         r = self.radius
         lo = max(0, index - r)
         hi = min(self.info.frame_count - 1, index + r)
-        buf = [self._derotate(video.read_frame(self.path, k), k)
-               for k in range(lo, hi + 1)]
+        raw = {k: video.read_frame(self.path, k) for k in range(lo, hi + 1)}
         with ThreadPoolExecutor(_NTHREADS) as ex:
-            med = _median_u8(buf, ex)
-        return self._rerotate_crop(med, index)
+            return self._combine(index, raw, ex)
 
     def run(self, out_path, *, crf: int = 16, progress=None, cancel=None):
         """Stream the whole clip to `out_path` (audio copied from source).
 
-        A single forward pass keeps a ring buffer of the last 2r+1 derotated
-        frames. Output frames are emitted in strict order in three phases:
-        leading (partial windows), centred (full windows), trailing (partial).
+        A single forward pass keeps the raw frames of the current window in a
+        ring buffer; each output frame warps its window onto itself.
         """
         n = self.info.frame_count
         r = self.radius
-        w_out = self.info.width
-        h_out = self.info.height
-        buf: deque[np.ndarray] = deque(maxlen=2 * r + 1)
-        idx: deque[int] = deque(maxlen=2 * r + 1)
-        state = {"written": 0}
+        buf: deque[tuple[int, np.ndarray]] = deque(maxlen=2 * r + 1)
+        written = 0
 
-        with video.FrameWriter(out_path, w_out, h_out, self.info.fps,
-                               source=self.path, crf=crf) as fw, \
+        with video.FrameWriter(out_path, self.info.width, self.info.height,
+                               self.info.fps, source=self.path,
+                               crf=crf) as fw, \
                 ThreadPoolExecutor(_NTHREADS) as ex:
-            reader = video.iter_frames(self.path)
-
-            def emit(center: int) -> bool:
-                lo, hi = max(0, center - r), min(n - 1, center + r)
-                sub = [f for k, f in zip(idx, buf) if lo <= k <= hi]
-                fw.write(self._rerotate_crop(_median_u8(sub, ex), center))
-                state["written"] += 1
+            reader = enumerate(video.iter_frames(self.path))
+            for c in range(n):
+                hi = min(n - 1, c + r)
+                while not buf or buf[-1][0] < hi:
+                    buf.append(next(reader))
+                raw = {k: f for k, f in buf if c - r <= k <= hi}
+                fw.write(self._combine(c, raw, ex))
+                written += 1
                 if progress:
-                    progress(state["written"], n)
-                return bool(cancel and cancel())
-
-            prime = min(2 * r + 1, n)
-            for i in range(prime):
-                buf.append(self._derotate(next(reader), i))
-                idx.append(i)
-
-            if n <= 2 * r + 1:                       # short clip: no streaming
-                for c in range(n):
-                    if emit(c):
-                        return state["written"]
-                return state["written"]
-
-            for c in range(0, r + 1):                # leading (centres 0..r)
-                if emit(c):
-                    return state["written"]
-
-            for i in range(2 * r + 1, n):            # centred (centres r+1..n-1-r)
-                buf.append(self._derotate(next(reader), i))
-                idx.append(i)
-                if emit(i - r):
-                    return state["written"]
-
-            for c in range(n - r, n):                # trailing (centres n-r..n-1)
-                if emit(c):
-                    return state["written"]
-
-        return state["written"]
+                    progress(written, n)
+                if cancel and cancel():
+                    break
+        return written
