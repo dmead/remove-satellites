@@ -47,3 +47,35 @@ def test_full_run_frame_count(tmp_path):
     n = pipeline.Cleaner(clip, m, radius=5).run(out)
     assert n == 48
     assert video.probe(out).frame_count == 48
+
+
+def test_parallel_export_matches_sequential(tmp_path):
+    """Chunked multi-process export = single-process export, frame for frame
+    (up to separate x264 encodes), with progress reaching every frame."""
+    clip = tmp_path / "sat.mp4"
+    make_clip(clip, n=72)
+    m = rotation.estimate(clip, ref_index=0, samples=14)
+    c = pipeline.Cleaner(clip, m, radius=5)
+    seq, par = tmp_path / "seq.mp4", tmp_path / "par.mp4"
+    ticks = []
+    assert c.run(seq, workers=1) == 72
+    assert c.run(par, workers=3, progress=lambda k, n: ticks.append(k)) == 72
+    assert ticks[-1] == 72 and ticks == sorted(ticks)
+    assert video.probe(par).frame_count == 72
+    for k in (0, 23, 24, 25, 47, 48, 71):          # incl. chunk boundaries
+        a = video.read_frame(seq, k).astype(int)
+        b = video.read_frame(par, k).astype(int)
+        assert np.abs(a - b).mean() < 1.0, k
+    assert not list(tmp_path.glob(".rs-segments-*"))   # temp cleaned up
+
+
+def test_parallel_export_cancel(tmp_path):
+    clip = tmp_path / "sat.mp4"
+    make_clip(clip, n=72)
+    m = rotation.estimate(clip, ref_index=0, samples=14)
+    out = tmp_path / "out.mp4"
+    n = pipeline.Cleaner(clip, m, radius=5).run(out, workers=3,
+                                                cancel=lambda: True)
+    assert n < 72
+    assert not out.exists()
+    assert not list(tmp_path.glob(".rs-segments-*"))

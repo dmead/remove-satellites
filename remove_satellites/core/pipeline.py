@@ -18,19 +18,23 @@ the sky median.
 from __future__ import annotations
 
 import math
+import multiprocessing
 import os
+import shutil
+import tempfile
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait
+from pathlib import Path
 
 import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
-from . import stars, video
+from . import hw, stars, video
 from .rotation import RotationModel
 from .track import Track
 
-_NTHREADS = min(os.cpu_count() or 4, 16)
+_NTHREADS = min(os.cpu_count() or 4, 32)
 
 
 def _rot_matrix(center, angle_deg, tx=0.0, ty=0.0):
@@ -159,31 +163,99 @@ class Cleaner:
         with ThreadPoolExecutor(_NTHREADS) as ex:
             return self._combine(index, raw, ex)
 
-    def run(self, out_path, *, crf: int = 16, progress=None, cancel=None):
-        """Stream the whole clip to `out_path` (audio copied from source).
+    def _render(self, lo: int, hi: int, emit, *, threads: int,
+                progress=None, cancel=None) -> bool:
+        """Emit cleaned frames lo..hi-1 in order. One sequential read of
+        lo-r .. hi-1+r through a ring buffer holding the current window.
+        Returns False if cancelled."""
+        n, r = self.info.frame_count, self.radius
+        buf: deque[tuple[int, np.ndarray]] = deque(maxlen=2 * r + 1)
+        start, stop = max(0, lo - r), min(n, hi + r)
+        reader = enumerate(video.iter_frames(self.path, start, stop), start)
+        with ThreadPoolExecutor(threads) as ex:
+            for c in range(lo, hi):
+                top = min(n - 1, c + r)
+                while not buf or buf[-1][0] < top:
+                    buf.append(next(reader))
+                emit(self._combine(c, {k: f for k, f in buf
+                                       if c - r <= k <= top}, ex))
+                if progress:
+                    progress(1)
+                if cancel and cancel():
+                    return False
+        return True
 
-        A single forward pass keeps the raw frames of the current window in a
-        ring buffer; each output frame warps its window onto itself.
+    def run(self, out_path, *, crf: int = 16, progress=None, cancel=None,
+            workers: int | None = None):
+        """Render the whole clip to `out_path` (audio copied from source).
+
+        One output frame costs ~1.2 s at 4K and threads stop helping past ~8
+        (memory bandwidth, serial copies), so the clip is split into
+        contiguous chunks rendered by several processes, each encoding its
+        own segment; the segments are then joined losslessly and the audio
+        muxed. How many processes and threads: `hw.plan` (or `workers`).
+        Returns frames written.
         """
         n = self.info.frame_count
-        r = self.radius
-        buf: deque[tuple[int, np.ndarray]] = deque(maxlen=2 * r + 1)
-        written = 0
+        p = hw.plan(self.info.width, self.info.height, self.radius,
+                    workers=workers)
+        w = min(p.export_workers, max(1, n // (4 * self.radius + 2)))
+        done = 0
 
-        with video.FrameWriter(out_path, self.info.width, self.info.height,
-                               self.info.fps, source=self.path,
-                               crf=crf) as fw, \
-                ThreadPoolExecutor(_NTHREADS) as ex:
-            reader = enumerate(video.iter_frames(self.path))
-            for c in range(n):
-                hi = min(n - 1, c + r)
-                while not buf or buf[-1][0] < hi:
-                    buf.append(next(reader))
-                raw = {k: f for k, f in buf if c - r <= k <= hi}
-                fw.write(self._combine(c, raw, ex))
-                written += 1
-                if progress:
-                    progress(written, n)
-                if cancel and cancel():
-                    break
-        return written
+        def tick(k=1):
+            nonlocal done
+            done += k
+            if progress:
+                progress(done, n)
+
+        if w == 1:
+            with video.FrameWriter(out_path, self.info.width,
+                                   self.info.height, self.info.fps,
+                                   source=self.path, crf=crf) as fw:
+                self._render(0, n, fw.write, threads=_NTHREADS,
+                             progress=tick, cancel=cancel)
+            return done
+
+        out_path = Path(out_path)
+        tmp = Path(tempfile.mkdtemp(prefix=".rs-segments-",
+                                    dir=out_path.parent))
+        bounds = np.linspace(0, n, w + 1).astype(int)
+        segs = [tmp / f"seg{i:03d}.mp4" for i in range(w)]
+        threads = max(1, p.cores // w)
+        spec = (str(self.path), self.track, self.radius, self.fg)
+        try:
+            with multiprocessing.Manager() as mgr, \
+                    ProcessPoolExecutor(w) as ex:
+                q, stop = mgr.Queue(), mgr.Event()
+                futs = [ex.submit(_render_segment, spec, int(a), int(b),
+                                  str(s), crf, threads, q, stop)
+                        for a, b, s in zip(bounds[:-1], bounds[1:], segs)]
+                pending = set(futs)
+                while pending:
+                    _, pending = wait(pending, timeout=0.2)
+                    while not q.empty():
+                        tick(q.get())
+                    if cancel and cancel():
+                        stop.set()
+                for f in futs:
+                    f.result()                      # re-raise worker errors
+                while not q.empty():
+                    tick(q.get())
+                if stop.is_set():
+                    return done
+            video.concat(segs, out_path, source=self.path)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return done
+
+
+def _render_segment(spec, lo, hi, seg_path, crf, threads, q, stop) -> bool:
+    """Worker process: render frames lo..hi-1 of the clip to one segment."""
+    path, motion, radius, fg = spec
+    c = Cleaner(path, motion, radius=radius, fg_mask=fg)
+    global _NTHREADS
+    _NTHREADS = threads                  # median strips: this process's share
+    with video.FrameWriter(seg_path, c.info.width, c.info.height,
+                           c.info.fps, crf=crf, threads=threads) as fw:
+        return c._render(lo, hi, fw.write, threads=threads,
+                         progress=q.put, cancel=stop.is_set)

@@ -29,16 +29,33 @@ def _describe(tr, w: int, h: int) -> None:
     typer.echo("  " + track.summary(tr, w, h))
 
 
+_WORKERS_HELP = ("processes for tracking/export (default: sized to this "
+                 "machine's cores and free RAM)")
+
+
+def _use_workers(workers: int | None, info, radius: int = 10) -> None:
+    """Apply --workers everywhere downstream and say what will be used."""
+    import os
+
+    from .core import hw
+
+    if workers:
+        os.environ["REMOVE_SATELLITES_WORKERS"] = str(workers)
+    typer.echo(hw.plan(info.width, info.height, radius).describe())
+
+
 @app.command()
 def detect(
     input: Path = typer.Argument(..., exists=True, dir_okay=False),
     track_path: Path = typer.Option(None, "--track",
                                     help="track cache (.npz)"),
+    workers: int = typer.Option(None, "--workers", "-j", help=_WORKERS_HELP),
 ):
     """Track the sky motion of a clip and summarise it."""
     from .core import video
 
     info = video.probe(input)
+    _use_workers(workers, info)
     _describe(_load_or_track(input, track_path), info.width, info.height)
 
 
@@ -57,6 +74,7 @@ def clean(
     cx: float = typer.Option(None, help="override pole x (skips tracking)"),
     cy: float = typer.Option(None, help="override pole y"),
     rate: float = typer.Option(None, help="override rate (rad/frame)"),
+    workers: int = typer.Option(None, "--workers", "-j", help=_WORKERS_HELP),
 ):
     """Remove satellite/plane trails from a star-field timelapse."""
     from .core import foreground as fgmod
@@ -64,6 +82,7 @@ def clean(
 
     output = output or _default_out(input)
     info = video.probe(input)
+    _use_workers(workers, info, radius)
 
     if cx is not None and cy is not None and rate is not None:
         model = rotation.RotationModel(

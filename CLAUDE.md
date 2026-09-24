@@ -51,11 +51,26 @@ Parked ideas (trail annotation) live in
 - **Output is written through ffmpeg** (`video.FrameWriter`), not OpenCV's
   VideoWriter, so the source audio can be `-c:a copy`'d. Frames are fed as raw
   bgr24 on stdin.
+- **`core/hw.plan` is the only place that sizes parallelism** (tracking
+  processes, export processes × threads, preview threads, GUI frame cache)
+  from cores, free RAM and frame size; `--workers`/`REMOVE_SATELLITES_WORKERS`
+  override it. Don't hard-code worker counts elsewhere. Its constants come
+  from benchmarks recorded in its docstring — re-measure on an idle machine
+  (other exports running skewed one earlier run badly) before changing them.
+- **Parallel work is chunked by frame range** and must equal the sequential
+  result: tracking chunks are identical to `workers=1` (seeks are frame-
+  accurate; tested), export chunks encode separate segments joined by the
+  concat demuxer (`-c copy`) then muxed with the source audio. Worker
+  functions are module-level (Windows spawn); any script that triggers them
+  needs an `if __name__ == "__main__":` guard.
+- **Star detection uses OpenCV components + bincount**, not scipy.ndimage
+  per-label reductions (7x slower at 4K); results are identical.
 
 ## Layout
 
 ```
-remove_satellites/core/video.py       probe / read_frame / iter_frames / FrameWriter
+remove_satellites/core/video.py       probe / read_frame / iter_frames / FrameWriter / concat
+remove_satellites/core/hw.py          plan(): parallelism sized from cores, free RAM, frame size
 remove_satellites/core/stars.py       background() / detect() -> [x,y,flux] centroids
 remove_satellites/core/track.py       estimate() -> Track (per-step homographies)
 remove_satellites/core/foreground.py  static_mask() -> camera-fixed pixels

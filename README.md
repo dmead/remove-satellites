@@ -44,7 +44,15 @@ uv run remove-satellites clean "night.mp4" --cx 1633 --cy 763 --rate -0.000326
 ```
 
 Key options: `-r/--radius` temporal-median half-window (bigger = stronger trail
-rejection), `--crf` x264 quality, `--no-foreground` to skip the land/tree mask.
+rejection), `--crf` x264 quality, `--no-foreground` to skip the land/tree mask,
+`-j/--workers` process count.
+
+**Using the machine.** Tracking and export run in parallel processes, sized
+automatically from the CPU count, free RAM and the clip's frame size; the
+plan is printed at the start (e.g. `32 CPUs, 127 GB free (auto): tracking 16
+processes, export 16×2 threads, …`). Override with `-j N` or
+`REMOVE_SATELLITES_WORKERS=N`. On a 32-thread i9-14900K a 4K, 763-frame clip
+tracks in ~35 s (was ~7 min) and exports ~2.75× faster than one process.
 
 ## GUI
 
@@ -68,10 +76,11 @@ stars stay pin-sharp because they are motionless during the median step.
 ## Layout
 
 ```
-remove_satellites/core/      video (OpenCV read, ffmpeg write+mux),
+remove_satellites/core/      video (OpenCV read, ffmpeg write/concat/mux, frame cache),
                              stars (centroids), track (per-step homographies),
                              foreground (land/tree mask), pipeline (window-aligned
-                             median), rotation (legacy pole+rate fit)
+                             median, parallel export), hw (worker plan),
+                             rotation (legacy pole+rate fit)
 remove_satellites/gui/       PySide6 app: window, preview, background workers
 remove_satellites/cli.py     typer CLI (detect / clean / gui)
 tests/                       synthetic fixtures (no real capture needed)

@@ -17,6 +17,7 @@ Convention: `steps[k]` maps frame-k pixel coords to frame-(k+1) coords.
 from __future__ import annotations
 
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,9 +132,32 @@ def _step(g0: np.ndarray, g1: np.ndarray, pts: np.ndarray,
     return h / h[2, 2], int(inl.sum()), float(np.median(r))
 
 
+def _steps_chunk(path, a: int, b: int, max_stars: int, ransac_px: float,
+                 min_inliers: int):
+    """Raw fits for steps a..b-1 (needs frames a..b), read sequentially.
+
+    Module-level so worker processes can import it."""
+    m = b - a
+    steps = np.full((m, 3, 3), np.nan)
+    inl = np.zeros(m, int)
+    res = np.full(m, np.nan)
+    prev_g = prev_pts = None
+    for i, frame in enumerate(video.iter_frames(path, a, b + 1)):
+        g = stars.to_gray(frame)
+        if prev_g is not None:
+            h, ni, r = _step(prev_g, g, prev_pts, ransac_px)
+            if h is not None and ni >= min_inliers:
+                steps[i - 1], inl[i - 1], res[i - 1] = h, ni, r
+        prev_g = g
+        if i < m:                                  # last frame: target only
+            prev_pts = stars.detect(frame, max_stars=max_stars)[:, :2]
+    return a, steps, inl, res
+
+
 def estimate(path, *, max_stars: int = 800, ransac_px: float = 0.7,
              min_inliers: int = 12, smooth: int = 3, max_dev: float = 0.25,
-             progress=None) -> Track:
+             progress=None, workers: int | None = None,
+             chunk: int | None = None) -> Track:
     """Track sky motion between every adjacent pair of frames.
 
     Stars are detected in frame k and followed into k+1 with pyramidal LK;
@@ -144,25 +168,44 @@ def estimate(path, *, max_stars: int = 800, ransac_px: float = 0.7,
     are then box-smoothed over ±`smooth` frames —
     timelapse intervals are regular, so the true step varies slowly while the
     per-step fit noise does not.
+
+    Steps are independent, so the clip is cut into contiguous chunks tracked
+    by several processes (`hw.plan`, or `workers`); each chunk is decoded
+    sequentially from a single seek. `progress(done, total)` reports steps
+    completed.
     """
+    from . import hw
     info = video.probe(path)
     n = info.frame_count
     steps = np.full((n - 1, 3, 3), np.nan)
     inl = np.zeros(n - 1, int)
     res = np.full(n - 1, np.nan)
 
-    prev_g = prev_pts = None
-    for k, frame in enumerate(video.iter_frames(path)):
-        g = stars.to_gray(frame)
-        if prev_g is not None:
-            h, ni, r = _step(prev_g, g, prev_pts, ransac_px)
-            if h is not None and ni >= min_inliers:
-                steps[k - 1], inl[k - 1] = h, ni
-                res[k - 1] = r
-            if progress:
-                progress(k, n)
-        prev_g = g
-        prev_pts = stars.detect(frame, max_stars=max_stars)[:, :2]
+    workers = hw.plan(info.width, info.height,
+                      workers=workers).track_workers
+    if chunk is None:        # a few chunks per worker keeps progress smooth
+        chunk = max(8, math.ceil((n - 1) / (workers * 4)))
+    spans = [(a, min(a + chunk, n - 1)) for a in range(0, n - 1, chunk)]
+    args = (max_stars, ransac_px, min_inliers)
+    done = 0
+
+    def take(r):
+        nonlocal done
+        a, s, i_, r_ = r
+        steps[a:a + len(s)], inl[a:a + len(s)], res[a:a + len(s)] = s, i_, r_
+        done += len(s)
+        if progress:
+            progress(done, n - 1)
+
+    if workers == 1 or len(spans) == 1:
+        for a, b in spans:
+            take(_steps_chunk(path, a, b, *args))
+    else:
+        with ProcessPoolExecutor(min(workers, len(spans))) as ex:
+            futs = [ex.submit(_steps_chunk, str(path), a, b, *args)
+                    for a, b in spans]
+            for f in as_completed(futs):
+                take(f.result())
 
     return finalize(steps, inl, res, info.width, info.height,
                     smooth=smooth, max_dev=max_dev)

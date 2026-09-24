@@ -77,6 +77,28 @@ def iter_frames(path: str | Path, start: int = 0, stop: int | None = None):
         cap.release()
 
 
+def concat(segments, out_path, *, source=None) -> None:
+    """Join same-encoded video segments losslessly (concat demuxer, stream
+    copy) and mux the source's audio, if any, onto the result."""
+    out_path = Path(out_path)
+    lst = out_path.with_name(out_path.name + ".concat.txt")
+    lst.write_text("".join(
+        "file '{}'\n".format(str(Path(s).resolve()).replace("'", r"'\''"))
+        for s in segments), encoding="utf-8")
+    args = [ffmpeg_bin(), "-y", "-v", "error",
+            "-f", "concat", "-safe", "0", "-i", str(lst)]
+    if source is not None:
+        args += ["-i", str(source), "-map", "0:v", "-map", "1:a?"]
+    args += ["-c", "copy", "-movflags", "+faststart", str(out_path)]
+    try:
+        r = subprocess.run(args, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg concat failed: {r.stderr.decode(errors='replace')}")
+    finally:
+        lst.unlink(missing_ok=True)
+
+
 def ffmpeg_bin() -> str:
     exe = shutil.which("ffmpeg")
     if not exe:
@@ -93,7 +115,7 @@ class FrameWriter:
     """
 
     def __init__(self, out_path, width, height, fps, *, source=None,
-                 crf=16, preset="medium"):
+                 crf=16, preset="medium", threads: int | None = None):
         self.proc: subprocess.Popen | None = None
         args = [
             ffmpeg_bin(), "-y", "-v", "error",
@@ -108,8 +130,10 @@ class FrameWriter:
         args += [
             "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(out_path),
         ]
+        if threads:                       # several encoders share the CPU
+            args += ["-threads", str(threads)]
+        args.append(str(out_path))
         self._args = args
 
     def __enter__(self) -> "FrameWriter":
