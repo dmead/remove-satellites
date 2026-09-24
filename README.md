@@ -52,8 +52,12 @@ rejection), `--crf` x264 quality, `--no-foreground` to skip the land/tree mask.
 uv run remove-satellites gui
 ```
 
-Open a clip, **Auto-detect rotation** (or set the pole and total spin by hand),
-scrub frames and toggle **Before/After**, pick a median window, then **Export**.
+Open a clip and **Auto-detect sky motion** (the same engine as the CLI; it
+tracks every frame the first time — minutes for 4K — then loads instantly
+from the `.track.npz` cache). **Show foreground mask** tints the land/trees
+that get a plain median. Scrub and toggle **Before/After**, pick a median
+window, then **Export**. The **Manual pole override** group (pole x/y and
+total spin) replaces the tracked motion when a clip defeats the tracker.
 
 ## How well it works
 

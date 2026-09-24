@@ -17,6 +17,14 @@ def bgr_to_pixmap(frame: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(img.copy())
 
 
+def tint_mask(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Frame with mask pixels tinted red (foreground overlay)."""
+    out = frame.copy()
+    m = mask.astype(bool)
+    out[m] = (0.55 * out[m] + np.array([0, 0, 115])).astype(np.uint8)
+    return out
+
+
 def draw_pole(pixmap: QPixmap, center: tuple[float, float]) -> QPixmap:
     """Return a copy of `pixmap` with a crosshair drawn at `center` (image px)."""
     out = QPixmap(pixmap)

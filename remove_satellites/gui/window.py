@@ -1,5 +1,9 @@
-"""remove-satellites main window — open a clip, detect/adjust the sky rotation,
-preview before/after, and export the trail-free video."""
+"""remove-satellites main window — open a clip, track the sky motion, preview
+before/after, and export the trail-free video.
+
+Auto-detect runs the same engine as the CLI (homography tracking, cached as
+`<clip>.track.npz`, plus the foreground mask). The old pole + rate controls
+survive as a manual override for clips the tracker can't handle."""
 
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QSpinBox, QStyle, QToolButton, QVBoxLayout,
                                QWidget)
 
-from ..core import rotation, video
+from ..core import track, video
 from ..core.rotation import RotationModel
 from . import preview
 from .worker import DetectWorker, ExportWorker, FrameWorker
@@ -60,7 +64,10 @@ class MainWindow(QMainWindow):
 
         self.path: str | None = None
         self.info: video.VideoInfo | None = None
-        self.model: RotationModel | None = None
+        self.track = None                    # auto-detected Track
+        self.fg = None                       # foreground mask (1 = land)
+        self.manual: RotationModel | None = None   # manual pole override
+        self._rev = 0                        # bumps on any motion change
         self.preset_output = preset_output
 
         self._worker = None                 # keep refs so QThreads aren't GC'd
@@ -158,13 +165,27 @@ class MainWindow(QMainWindow):
         self._debounce.timeout.connect(self._refresh_preview)
 
     def _rotation_group(self) -> QGroupBox:
-        g = QGroupBox("Sky rotation")
+        g = QGroupBox("Sky motion")
         lay = QVBoxLayout(g)
-        self.detect_btn = QPushButton("Auto-detect rotation")
+        self.detect_btn = QPushButton("Auto-detect sky motion")
         self.detect_btn.clicked.connect(self._detect)
         lay.addWidget(self.detect_btn)
 
-        form = QFormLayout()
+        self.rot_status = QLabel("")
+        self.rot_status.setWordWrap(True)
+        self.rot_status.setStyleSheet("color:#888;")
+        lay.addWidget(self.rot_status)
+
+        self.show_fg = QCheckBox("Show foreground mask")
+        self.show_fg.toggled.connect(self._refresh_preview)
+        lay.addWidget(self.show_fg)
+
+        # the old pole + rate model, kept as a fallback
+        self.override = QGroupBox("Manual pole override")
+        self.override.setCheckable(True)
+        self.override.setChecked(False)
+        self.override.toggled.connect(self._on_override)
+        form = QFormLayout(self.override)
         self.cx_spin = QDoubleSpinBox()
         self.cy_spin = QDoubleSpinBox()
         for s in (self.cx_spin, self.cy_spin):
@@ -179,17 +200,20 @@ class MainWindow(QMainWindow):
         form.addRow("Pole X", self.cx_spin)
         form.addRow("Pole Y", self.cy_spin)
         form.addRow("Total spin", self.total_spin)
-        lay.addLayout(form)
-
         self.show_pole = QCheckBox("Show pole marker")
         self.show_pole.setChecked(True)
         self.show_pole.toggled.connect(self._refresh_preview)
-        lay.addWidget(self.show_pole)
-
-        self.rot_status = QLabel("")
-        self.rot_status.setStyleSheet("color:#888;")
-        lay.addWidget(self.rot_status)
+        form.addRow(self.show_pole)
+        lay.addWidget(self.override)
         return g
+
+    @property
+    def motion(self):
+        """What the cleaner uses: the manual override when it's on,
+        otherwise the tracked sky motion."""
+        if self.override.isChecked() and self.manual is not None:
+            return self.manual
+        return self.track
 
     def _cleaning_group(self) -> QGroupBox:
         g = QGroupBox("Cleaning")
@@ -247,7 +271,7 @@ class MainWindow(QMainWindow):
 
     # ---- state ----------------------------------------------------------
     def _set_enabled(self, on: bool):
-        for w in (self.detect_btn, self.cx_spin, self.cy_spin, self.total_spin,
+        for w in (self.detect_btn, self.override, self.show_fg,
                   self.radius, self.export_btn, self.scrub, self.frame_spin,
                   self.before_btn, self.after_btn, self.play_btn,
                   self.rewind_btn):
@@ -266,8 +290,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "remove-satellites", f"Cannot open:\n{e}")
             return
         self.path = fn
-        self.model = None
-        self._invalidate_clean()
+        self.track = self.fg = self.manual = None
+        self.override.setChecked(False)
+        self._invalidate_motion()
         n = self.info.frame_count
         self.scrub.setRange(0, n - 1)
         self.frame_spin.setRange(0, n - 1)
@@ -280,46 +305,62 @@ class MainWindow(QMainWindow):
             Path(fn).with_name(Path(fn).stem + "_no-satellites.mp4"))
         self.out_edit.setText(default_out)
         self._set_enabled(True)
-        self.rot_status.setText("Run auto-detect (or set the pole manually).")
         self._display()
+        if track.default_cache(fn).exists():      # cheap: load it right away
+            self._detect()
+        else:
+            self.rot_status.setText(
+                "Run auto-detect: tracks the stars through every frame "
+                "(a few minutes for 4K; cached for next time).")
 
-    # ---- rotation -------------------------------------------------------
+    # ---- sky motion -----------------------------------------------------
     def _detect(self):
         if not self.path:
             return
         self.detect_btn.setEnabled(False)
         self.rot_status.setText("Detecting…")
         self._worker = DetectWorker(self.path)
+        self._worker.stage.connect(self.rot_status.setText)
+        self._worker.progress.connect(
+            lambda i, n: self.rot_status.setText(
+                f"Tracking sky motion… frame {i} of {n}"))
         self._worker.done.connect(self._detected)
         self._worker.failed.connect(self._detect_failed)
         self._worker.start()
 
     @Slot(object)
-    def _detected(self, model: RotationModel):
+    def _detected(self, res: dict):
         self.detect_btn.setEnabled(True)
-        self._apply_model(model)
+        self.track, self.fg = res["track"], res["fg"]
+        self._prefill_override(res.get("pole_guess"))
+        self._invalidate_motion()
         self.rot_status.setText(
-            f"pole ({model.center[0]:.0f}, {model.center[1]:.0f}) · "
-            f"{model.total_deg:.2f}° total · residual {model.residual_px:.2f}px")
+            f"{res['summary']} · foreground {100 * self.fg.mean():.0f}% of "
+            f"frame{' · cached track' if res['cached'] else ''}")
+        self._refresh_preview()
 
     @Slot(str)
     def _detect_failed(self, msg: str):
         self.detect_btn.setEnabled(True)
-        self.rot_status.setText("Detection failed — set the pole manually.")
-        QMessageBox.warning(self, "remove-satellites", f"Rotation detection failed:\n{msg}")
+        self.rot_status.setText("Detection failed — try the manual pole override.")
+        QMessageBox.warning(self, "remove-satellites",
+                            f"Sky-motion detection failed:\n{msg}")
 
-    def _apply_model(self, model: RotationModel):
-        self.model = model
-        self._invalidate_clean()
+    def _prefill_override(self, guess):
+        """Start the manual override from a pole estimate (see
+        worker.pole_guess), not (0, 0, 0°) — which silently means 'no
+        rotation'. Far-off-frame poles give big numbers; that's honest."""
+        self.manual = None                 # rebuilt from the spins if enabled
+        if guess is None:
+            return
         block = (self.cx_spin, self.cy_spin, self.total_spin)
         for w in block:
             w.blockSignals(True)
-        self.cx_spin.setValue(model.center[0])
-        self.cy_spin.setValue(model.center[1])
-        self.total_spin.setValue(math.degrees(model.omega * (model.n_frames - 1)))
+        self.cx_spin.setValue(guess[0])
+        self.cy_spin.setValue(guess[1])
+        self.total_spin.setValue(guess[2])
         for w in block:
             w.blockSignals(False)
-        self._refresh_preview()
 
     def _on_manual_rotation(self):
         if not self.info:
@@ -327,13 +368,25 @@ class MainWindow(QMainWindow):
         n = self.info.frame_count
         total_rad = math.radians(self.total_spin.value())
         omega = total_rad / (n - 1) if n > 1 else 0.0
-        self.model = RotationModel(
+        self.manual = RotationModel(
             center=(self.cx_spin.value(), self.cy_spin.value()),
             omega=omega, ref_index=0, n_frames=n,
             residual_px=float("nan"), n_pairs=0)
-        self._invalidate_clean()
-        self.rot_status.setText("manual rotation")
+        if self.override.isChecked():
+            self._invalidate_motion()
+            self._refresh_preview()
+
+    def _on_override(self, on: bool):
+        if on and self.manual is None:
+            self._on_manual_rotation()
+        self._invalidate_motion()
+        if on:
+            self.rot_status.setText("manual pole + rate (override)")
         self._refresh_preview()
+
+    def _invalidate_motion(self):
+        self._rev += 1
+        self._invalidate_clean()
 
     # ---- preview --------------------------------------------------------
     def _on_scrub(self, v: int):
@@ -349,9 +402,12 @@ class MainWindow(QMainWindow):
             self._debounce.start()
 
     def _blit(self, frame):
+        if self.show_fg.isChecked() and self.fg is not None:
+            frame = preview.tint_mask(frame, self.fg)
         pm = preview.bgr_to_pixmap(frame)
-        if self.show_pole.isChecked() and self.model:
-            pm = preview.draw_pole(pm, self.model.center)
+        if self.override.isChecked() and self.show_pole.isChecked() \
+                and self.manual is not None:
+            pm = preview.draw_pole(pm, self.manual.center)
         self.preview.set_source(pm)
 
     def _display(self, idx: int | None = None):
@@ -361,15 +417,15 @@ class MainWindow(QMainWindow):
         if idx is None:
             idx = self.scrub.value()
         after = self.after_btn.isChecked()
-        if after and self.model and self._clean_video_valid():
+        if after and self.motion is not None and self._clean_video_valid():
             self._blit(video.read_frame(self._clean_video, idx))
-        elif after and self.model:
+        elif after and self.motion is not None:
             cached = self._clean_cache.get(idx)
             if cached is not None:
                 self._blit(cached)
             else:                       # slow one-off clean of this frame
                 self.rot_status_busy("cleaning preview frame…")
-                self._worker = FrameWorker(self.path, self.model,
+                self._worker = FrameWorker(self.path, self.motion, self.fg,
                                            self.radius.value(), idx)
                 self._worker.done.connect(self._frame_ready)
                 self._worker.failed.connect(lambda m: self.rot_status_busy(""))
@@ -398,7 +454,8 @@ class MainWindow(QMainWindow):
         if not self.path:
             return
         # After playback needs a fully-rendered cleaned clip; render it once
-        if self.after_btn.isChecked() and self.model and not self._clean_video_valid():
+        if self.after_btn.isChecked() and self.motion is not None \
+                and not self._clean_video_valid():
             self._render_clean(then_play=True)
             return
         self._begin_play()
@@ -439,12 +496,11 @@ class MainWindow(QMainWindow):
 
     # ---- cleaned-clip cache for After playback --------------------------
     def _settings_key(self):
-        m = self.model
-        return (round(m.center[0], 2), round(m.center[1], 2),
-                round(m.omega, 9), self.radius.value()) if m else None
+        return (self._rev, self.radius.value()) \
+            if self.motion is not None else None
 
     def _clean_video_valid(self) -> bool:
-        return bool(self._clean_video and self.model
+        return bool(self._clean_video and self.motion is not None
                     and self._clean_key == self._settings_key()
                     and os.path.exists(self._clean_video))
 
@@ -464,8 +520,8 @@ class MainWindow(QMainWindow):
         tmp = os.path.join(self._tmpdir, f"clean_{abs(hash(self._settings_key()))}.mp4")
         self._pending_clean = (tmp, self._settings_key(), then_play)
         self._begin_progress("Rendering cleaned preview…")
-        self._job = ExportWorker(self.path, self.model, self.radius.value(),
-                                 tmp, crf=18)
+        self._job = ExportWorker(self.path, self.motion, self.fg,
+                                 self.radius.value(), tmp, crf=18)
         self._job.progress.connect(self._export_progress)
         self._job.done.connect(self._clean_ready)
         self._job.failed.connect(self._clean_failed)
@@ -497,10 +553,11 @@ class MainWindow(QMainWindow):
             self.out_edit.setText(fn)
 
     def _export(self):
-        if not (self.path and self.model):
+        if not (self.path and self.motion is not None):
             QMessageBox.information(
                 self, "remove-satellites",
-                "Detect or set the sky rotation first.")
+                "Auto-detect the sky motion first (or use the manual pole "
+                "override).")
             return
         self._stop_play()
         out = self.out_edit.text().strip()
@@ -510,8 +567,9 @@ class MainWindow(QMainWindow):
             if not out:
                 return
         self._begin_progress("Exporting cleaned video…")
-        self._job = ExportWorker(self.path, self.model, self.radius.value(),
-                                 out, crf=self.crf.currentData())
+        self._job = ExportWorker(self.path, self.motion, self.fg,
+                                 self.radius.value(), out,
+                                 crf=self.crf.currentData())
         self._job.progress.connect(self._export_progress)
         self._job.done.connect(self._export_done)
         self._job.failed.connect(self._export_failed)
@@ -519,7 +577,7 @@ class MainWindow(QMainWindow):
 
     # ---- shared progress UI (export + preview render) -------------------
     _BUSY_WIDGETS = ("export_btn", "open_btn", "play_btn", "detect_btn",
-                     "cx_spin", "cy_spin", "total_spin", "radius")
+                     "override", "radius")
 
     def _begin_progress(self, label: str):
         self.rot_status_busy(label)

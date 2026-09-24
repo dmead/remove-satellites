@@ -62,7 +62,8 @@ remove_satellites/core/foreground.py  static_mask() -> camera-fixed pixels
 remove_satellites/core/rotation.py    legacy pole + rate fit (GUI manual controls)
 remove_satellites/core/pipeline.py    Cleaner: .frame(i) preview, .run(out) full export
 remove_satellites/cli.py              typer: detect / clean / gui (track cached as <clip>.track.npz)
-remove_satellites/gui/                app, window, preview, worker — still pole + rate based
+remove_satellites/gui/                app, window, preview, worker — same engine as the CLI (Track + foreground mask); pole + rate only as a manual override
+scratch/gui_harness.py                drives the real MainWindow offscreen and scores it against a reference clean (gitignored)
 tests/synth.py                        synthetic field: rotation, drift (pan), ground, streak
 ```
 
