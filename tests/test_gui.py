@@ -72,3 +72,34 @@ def test_gui_detect_preview_export(tmp_path, monkeypatch):
     assert video.probe(dst).frame_count == 60
     win.close()
 
+
+def test_gui_scrubbing_renders_only_latest_preview(tmp_path, monkeypatch):
+    """Fast scrubbing in After view: one render at a time, the in-between
+    requests are skipped, the frame you land on is shown, no thread leaks."""
+    from remove_satellites.gui import window as W
+
+    clip = tmp_path / "spin.mp4"
+    make_clip(clip, n=40, trail=None)
+    monkeypatch.setattr(W.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(clip), "")))
+    launched = []
+    real = W.FrameWorker
+
+    def spy(*a, **k):
+        launched.append(a[4])
+        return real(*a, **k)
+    monkeypatch.setattr(W, "FrameWorker", spy)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    win = W.MainWindow()
+    win._open()
+    win.detect_btn.click()
+    _wait(app, lambda: win.detect_btn.isEnabled() and win.track is not None)
+    win.scrub.setValue(10)
+    win._set_view(True)
+    for k in (11, 12, 13, 14, 15):            # while 10 is still rendering
+        win._request_preview(k)
+    _wait(app, lambda: 15 in win._clean_cache and not win._preview_busy)
+    assert launched == [10, 15]
+    _wait(app, lambda: not win._threads)
+    win.close()

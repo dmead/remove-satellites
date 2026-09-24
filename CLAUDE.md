@@ -63,13 +63,18 @@ Parked ideas (trail annotation) live in
   concat demuxer (`-c copy`) then muxed with the source audio. Worker
   functions are module-level (Windows spawn); any script that triggers them
   needs an `if __name__ == "__main__":` guard.
+- **Preview reads its window sequentially** (one seek, then decode forward)
+  through a byte-bounded `video.FrameCache`; a random 4K seek costs ~0.4 s.
+  The GUI renders one preview at a time, latest request wins, and holds every
+  running QThread in `_threads` until it finishes (a collected running
+  QThread aborts the process).
 - **Star detection uses OpenCV components + bincount**, not scipy.ndimage
   per-label reductions (7x slower at 4K); results are identical.
 
 ## Layout
 
 ```
-remove_satellites/core/video.py       probe / read_frame / iter_frames / FrameWriter / concat
+remove_satellites/core/video.py       probe / read_frame / iter_frames / FrameWriter / concat / FrameCache
 remove_satellites/core/hw.py          plan(): parallelism sized from cores, free RAM, frame size
 remove_satellites/core/stars.py       background() / detect() -> [x,y,flux] centroids
 remove_satellites/core/track.py       estimate() -> Track (per-step homographies)

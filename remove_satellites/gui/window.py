@@ -70,9 +70,14 @@ class MainWindow(QMainWindow):
         self._rev = 0                        # bumps on any motion change
         self.preset_output = preset_output
 
-        self._worker = None                 # keep refs so QThreads aren't GC'd
+        # every running QThread is referenced here until it finishes: a
+        # QThread garbage-collected while running aborts the process
+        self._threads: set = set()
         self._job = None                     # currently running cancellable render
         self._clean_cache: dict[int, object] = {}
+        self._frames = video.FrameCache()    # decoded source frames, per clip
+        self._preview_busy = False
+        self._preview_want: int | None = None   # latest preview request
         self._playing = False
         # a fully-rendered cleaned copy for smooth After playback
         self._clean_video: str | None = None
@@ -290,6 +295,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "remove-satellites", f"Cannot open:\n{e}")
             return
         self.path = fn
+        from ..core import hw
+        self._plan = hw.plan(self.info.width, self.info.height,
+                             self.radius.value())
+        self._frames = video.FrameCache(self._plan.cache_bytes)
+        self.statusBar().showMessage(self._plan.describe(), 15000)
+        self._preview_want = None
         self.track = self.fg = self.manual = None
         self.override.setChecked(False)
         self._invalidate_motion()
@@ -319,14 +330,20 @@ class MainWindow(QMainWindow):
             return
         self.detect_btn.setEnabled(False)
         self.rot_status.setText("Detecting…")
-        self._worker = DetectWorker(self.path)
-        self._worker.stage.connect(self.rot_status.setText)
-        self._worker.progress.connect(
+        w = DetectWorker(self.path)
+        w.stage.connect(self.rot_status.setText)
+        w.progress.connect(
             lambda i, n: self.rot_status.setText(
-                f"Tracking sky motion… frame {i} of {n}"))
-        self._worker.done.connect(self._detected)
-        self._worker.failed.connect(self._detect_failed)
-        self._worker.start()
+                f"Tracking sky motion… {i} of {n} frames"))
+        w.done.connect(self._detected)
+        w.failed.connect(self._detect_failed)
+        self._start(w)
+
+    def _start(self, w):
+        """Start a worker thread and hold it until it has finished."""
+        self._threads.add(w)
+        w.finished.connect(lambda w=w: self._threads.discard(w))
+        w.start()
 
     @Slot(object)
     def _detected(self, res: dict):
@@ -424,14 +441,16 @@ class MainWindow(QMainWindow):
             if cached is not None:
                 self._blit(cached)
             else:                       # slow one-off clean of this frame
-                self.rot_status_busy("cleaning preview frame…")
-                self._worker = FrameWorker(self.path, self.motion, self.fg,
-                                           self.radius.value(), idx)
-                self._worker.done.connect(self._frame_ready)
-                self._worker.failed.connect(lambda m: self.rot_status_busy(""))
-                self._worker.start()
+                self._request_preview(idx)
         else:
-            self._blit(video.read_frame(self.path, idx))
+            self._blit(self._source_frame(idx))
+
+    def _source_frame(self, idx: int):
+        f = self._frames.get(idx)
+        if f is None:
+            f = video.read_frame(self.path, idx)
+            self._frames.put(idx, f)
+        return f
 
     def _refresh_preview(self):
         self._display()
@@ -439,12 +458,44 @@ class MainWindow(QMainWindow):
     def rot_status_busy(self, msg):
         self.statusBar().showMessage(msg) if msg else self.statusBar().clearMessage()
 
-    @Slot(int, object)
-    def _frame_ready(self, idx: int, frame):
+    # one cleaned preview renders at a time; while it runs, only the latest
+    # request is remembered (scrubbing doesn't queue up a backlog)
+    def _request_preview(self, idx: int):
+        self._preview_want = idx
+        if not self._preview_busy:
+            self._launch_preview(idx)
+
+    def _launch_preview(self, idx: int):
+        self._preview_busy = True
+        self.rot_status_busy(f"cleaning preview frame {idx}…")
+        w = FrameWorker(self.path, self.motion, self.fg, self.radius.value(),
+                        idx, cache=self._frames, key=self._settings_key())
+        w.done.connect(self._frame_ready)
+        w.failed.connect(self._frame_failed)
+        self._start(w)
+
+    @Slot(int, object, object)
+    def _frame_ready(self, idx: int, frame, key):
+        self._preview_busy = False
         self.rot_status_busy("")
-        self._clean_cache[idx] = frame
-        if self.after_btn.isChecked() and self.scrub.value() == idx:
-            self._blit(frame)
+        if key == self._settings_key():         # not computed with old settings
+            self._clean_cache[idx] = frame
+            if self.after_btn.isChecked() and self.scrub.value() == idx:
+                self._blit(frame)
+        self._next_preview()
+
+    @Slot(str)
+    def _frame_failed(self, msg: str):
+        self._preview_busy = False
+        self.rot_status_busy("")
+        QMessageBox.warning(self, "remove-satellites", f"Preview failed:\n{msg}")
+
+    def _next_preview(self):
+        want = self._preview_want
+        if want is not None and self.after_btn.isChecked() \
+                and self.motion is not None and want not in self._clean_cache \
+                and not self._clean_video_valid():
+            self._launch_preview(want)
 
     # ---- playback -------------------------------------------------------
     def _toggle_play(self):
@@ -525,7 +576,7 @@ class MainWindow(QMainWindow):
         self._job.progress.connect(self._export_progress)
         self._job.done.connect(self._clean_ready)
         self._job.failed.connect(self._clean_failed)
-        self._job.start()
+        self._start(self._job)
 
     @Slot(str)
     def _clean_ready(self, out: str):
@@ -573,7 +624,7 @@ class MainWindow(QMainWindow):
         self._job.progress.connect(self._export_progress)
         self._job.done.connect(self._export_done)
         self._job.failed.connect(self._export_failed)
-        self._job.start()
+        self._start(self._job)
 
     # ---- shared progress UI (export + preview render) -------------------
     _BUSY_WIDGETS = ("export_btn", "open_btn", "play_btn", "detect_btn",
@@ -622,6 +673,7 @@ class MainWindow(QMainWindow):
         self._stop_play()
         if self._job is not None:
             self._job.cancel()
-            self._job.wait(2000)
+        for t in list(self._threads):       # let workers wind down cleanly
+            t.wait(5000)
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         super().closeEvent(ev)

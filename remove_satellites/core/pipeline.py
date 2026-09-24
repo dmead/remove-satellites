@@ -154,12 +154,29 @@ class Cleaner:
         sky[rs] = (a * plain + (1.0 - a) * sky[rs] + 0.5).astype(np.uint8)
         return sky
 
-    def frame(self, index: int) -> np.ndarray:
-        """Cleaned single frame (processes just its median window)."""
+    def frame(self, index: int, cache: video.FrameCache | None = None
+              ) -> np.ndarray:
+        """Cleaned single frame (processes just its median window).
+
+        The window is decoded in one sequential pass from a single seek (not
+        2r+1 random seeks); with a `cache`, frames decoded for earlier
+        previews are reused, so scrubbing mostly skips decoding."""
         r = self.radius
         lo = max(0, index - r)
         hi = min(self.info.frame_count - 1, index + r)
-        raw = {k: video.read_frame(self.path, k) for k in range(lo, hi + 1)}
+        raw = {}
+        for k in range(lo, hi + 1):
+            f = cache.get(k) if cache is not None else None
+            if f is not None:
+                raw[k] = f
+        missing = [k for k in range(lo, hi + 1) if k not in raw]
+        if missing:
+            for k, f in enumerate(video.iter_frames(
+                    self.path, missing[0], missing[-1] + 1), missing[0]):
+                if k not in raw:
+                    raw[k] = f
+                    if cache is not None:
+                        cache.put(k, f)
         with ThreadPoolExecutor(_NTHREADS) as ex:
             return self._combine(index, raw, ex)
 

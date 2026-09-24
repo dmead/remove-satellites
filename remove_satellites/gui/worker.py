@@ -81,20 +81,28 @@ def pole_guess(path, tr, info) -> tuple[float, float, float] | None:
 
 
 class FrameWorker(QThread):
-    """Compute one cleaned frame for the before/after preview."""
-    done = Signal(int, object)     # index, ndarray
+    """Compute one cleaned frame for the before/after preview.
+
+    Decoded frames go through the window's shared FrameCache, and `key`
+    (the settings it was computed with) comes back with the result so the
+    window can drop results made stale while it ran."""
+    done = Signal(int, object, object)     # index, ndarray, settings key
     failed = Signal(str)
 
-    def __init__(self, path, motion, fg_mask, radius: int, index: int):
+    def __init__(self, path, motion, fg_mask, radius: int, index: int, *,
+                 cache=None, key=None):
         super().__init__()
         self.path, self.motion, self.fg = path, motion, fg_mask
         self.radius, self.index = radius, index
+        self.cache, self.key = cache, key
 
     def run(self):
         try:
             cleaner = pipeline.Cleaner(self.path, self.motion,
                                        radius=self.radius, fg_mask=self.fg)
-            self.done.emit(self.index, cleaner.frame(self.index))
+            self.done.emit(self.index,
+                           cleaner.frame(self.index, cache=self.cache),
+                           self.key)
         except Exception as e:                                  # noqa: BLE001
             self.failed.emit(str(e))
 

@@ -99,6 +99,43 @@ def concat(segments, out_path, *, source=None) -> None:
         lst.unlink(missing_ok=True)
 
 
+class FrameCache:
+    """Thread-safe LRU of decoded frames, bounded by bytes.
+
+    Scrubbing the preview reuses most of the previous median window; keeping
+    decoded frames avoids re-seeking (a random 4K seek costs ~0.4 s)."""
+
+    def __init__(self, budget_bytes: int = 2 << 30):
+        import threading
+        from collections import OrderedDict
+        self.budget = budget_bytes
+        self._d: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, k: int):
+        with self._lock:
+            f = self._d.get(k)
+            if f is not None:
+                self._d.move_to_end(k)
+            return f
+
+    def put(self, k: int, frame: np.ndarray) -> None:
+        with self._lock:
+            if k in self._d:
+                return
+            self._d[k] = frame
+            self._bytes += frame.nbytes
+            while self._bytes > self.budget and len(self._d) > 1:
+                _, old = self._d.popitem(last=False)
+                self._bytes -= old.nbytes
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+            self._bytes = 0
+
+
 def ffmpeg_bin() -> str:
     exe = shutil.which("ffmpeg")
     if not exe:
