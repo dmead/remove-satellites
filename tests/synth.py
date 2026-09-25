@@ -17,12 +17,16 @@ from remove_satellites.core.video import FrameWriter
 
 def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
               total_deg=12.0, n_stars=45, trail=(25, 31), seed=0,
-              drift=(0.0, 0.0), ground=0, lights=0) -> dict:
+              drift=(0.0, 0.0), ground=0, lights=0, drop=0) -> dict:
     """drift: per-frame (dx, dy) sky translation, i.e. a pole so far
     off-frame the motion is a pan. ground: height of a static textured band
     along the bottom that occludes the sky like land. lights: bright
     camera-fixed points (floodlit structures, lamps), brighter and more
-    numerous than the stars if you like."""
+    numerous than the stars if you like. drop: a source frame is skipped
+    after every `drop` output frames, as a frame-rate conversion does
+    (returned `clock`: each output frame's source index)."""
+    clock = [k + (k // drop if drop else 0) for k in range(n)]
+    n_src = clock[-1] + 1
     rng = np.random.default_rng(seed)
     cx, cy = center
     # scatter stars upstream of the drift so the field stays populated
@@ -47,17 +51,20 @@ def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
     with FrameWriter(path, w, h, 24, crf=6) as fw:
         for k in range(n):
             img = rng.normal(0, 2.0, (h, w, 3)).clip(0, 255).astype(np.uint8)
-            ang = math.radians(total_deg) * (k / (n - 1))
+            ang = math.radians(total_deg) * (clock[k] / (n_src - 1))
             c, s = math.cos(ang), math.sin(ang)
             for (x0, y0), b in zip(stars, bright):
                 dx, dy = x0 - cx, y0 - cy
-                x = cx + c * dx - s * dy + drift[0] * k
-                y = cy + s * dx + c * dy + drift[1] * k
+                x = cx + c * dx - s * dy + drift[0] * clock[k]
+                y = cy + s * dx + c * dy + drift[1] * clock[k]
                 cv2.circle(img, (round(x), round(y)), 2,
                            (int(b), int(b), int(b)), -1)
             for (x, y), b in zip(lamps, lamp_b):
-                cv2.circle(img, (round(x), round(y)), 3,
-                           (int(b), int(b), int(b)), -1)
+                # fixed, but jittering a little (compression, flicker)
+                jx, jy = rng.normal(0, 0.35, 2)
+                cv2.circle(img, (round((x + jx) * 16), round((y + jy) * 16)),
+                           3 * 16, (int(b), int(b), int(b)), -1, cv2.LINE_AA,
+                           shift=4)
             if ground:
                 img[h - ground:] = land
             if trail and trail[0] <= k < trail[1]:
@@ -68,4 +75,5 @@ def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
             fw.write(img)
 
     return {"center": center, "total_deg": total_deg, "n": n,
-            "trail": trail, "w": w, "h": h, "ground": ground}
+            "trail": trail, "w": w, "h": h, "ground": ground,
+            "clock": clock}

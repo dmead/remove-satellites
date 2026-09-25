@@ -30,10 +30,14 @@ Parked ideas (trail annotation) live in
   wide-angle projection, where the apparent rotation/scale drift over a clip.
   `Track.between(src, dst)` composes steps; backwards it must undo step
   `src-1` first (order matters — homographies don't commute).
-- **Tracking fits the movers**: `_step` drops points that moved < 0.3 px when
-  enough moved, so a static foreground can't win RANSAC with an identity fit.
-  `finalize` rejects steps whose motion is > 25% off the clip median
-  (washed-out frames lock onto the foreground) and gap-fills them.
+- **Tracking fits the movers**: `_step` drops points that moved less than
+  0.3 px, or 30% of the fastest points' motion (up to 1 px: compression and
+  flicker make fixed features jitter), when enough moved, so a static
+  foreground can't win RANSAC with an identity fit. `finalize` rejects steps
+  whose motion is > 25% off the clip median (washed-out frames lock onto the
+  foreground) and gap-fills them — except whole multiples of it (a frame
+  dropped by a frame-rate conversion), which are kept and counted in
+  `Track.mult` / `Track.clock`. Only single steps are smoothed together.
 - **Camera-fixed features are excluded before tracking** (`static_points`):
   features found at the same pixel in frames spread across the clip are
   dropped from every frame's detections, and the next brightest taken. A

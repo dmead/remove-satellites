@@ -33,10 +33,20 @@ class Track:
     steps: np.ndarray            # (n-1, 3, 3) float64, frame k -> k+1
     inliers: np.ndarray          # (n-1,) RANSAC inliers per step (0 = filled)
     residual_px: float           # median per-step star residual
+    # (n-1,) source intervals each step spans: 1 normally, 2 across a frame
+    # dropped by a frame-rate conversion, 0 for a duplicated frame
+    mult: np.ndarray | None = None
 
     @property
     def n_frames(self) -> int:
         return len(self.steps) + 1
+
+    @property
+    def clock(self) -> np.ndarray:
+        """Each frame's capture index (frame 0 = 0): where the sky says the
+        frame sits in the original sequence, dropped frames skipped."""
+        m = np.ones(len(self.steps), int) if self.mult is None else self.mult
+        return np.concatenate([[0], np.cumsum(m)])
 
     def between(self, src: int, dst: int) -> np.ndarray:
         """Homography mapping frame `src` coords to frame `dst` coords."""
@@ -57,14 +67,16 @@ class Track:
         return float(np.median(np.hypot(*(q.reshape(-1, 2) - p).T)))
 
     def save(self, path) -> None:
+        extra = {} if self.mult is None else {"mult": self.mult}
         np.savez(path, steps=self.steps, inliers=self.inliers,
-                 residual_px=self.residual_px)
+                 residual_px=self.residual_px, **extra)
 
     @classmethod
     def load(cls, path) -> "Track":
         z = np.load(path)
         return cls(steps=z["steps"], inliers=z["inliers"],
-                   residual_px=float(z["residual_px"]))
+                   residual_px=float(z["residual_px"]),
+                   mult=z["mult"] if "mult" in z.files else None)
 
     @classmethod
     def from_rotation(cls, model: RotationModel, sign: float = 1.0) -> "Track":
@@ -117,8 +129,14 @@ def _step(g0: np.ndarray, g1: np.ndarray, pts: np.ndarray,
     ok = st.ravel() == 1
     # camera-fixed features (rocks, lit trees) can outnumber the stars and
     # win the RANSAC vote with an identity fit; the sky is what moves, so
-    # fit to the movers when there are enough of them
-    moving = ok & (np.hypot(*(q - p).reshape(-1, 2).T) > static_px)
+    # fit to the movers when there are enough of them. Compression and
+    # flicker make fixed features jitter by a fraction of a pixel, so
+    # "moving" scales with how far the sky moves (the fastest points), up
+    # to a pixel
+    mv = np.hypot(*(q - p).reshape(-1, 2).T)
+    if ok.any():
+        static_px = max(static_px, min(1.0, 0.3 * np.percentile(mv[ok], 90)))
+    moving = ok & (mv > static_px)
     if moving.sum() >= max(8, ok.sum() // 10):
         ok = moving
     if ok.sum() < 8:
@@ -253,32 +271,48 @@ def estimate(path, *, max_stars: int = 800, ransac_px: float = 0.7,
 def finalize(steps: np.ndarray, inl: np.ndarray, res: np.ndarray,
              w: int, h: int, *, smooth: int = 3,
              max_dev: float = 0.25) -> Track:
-    """Reject, gap-fill and smooth raw per-step fits (NaN steps = no fit)."""
+    """Reject, gap-fill and smooth raw per-step fits (NaN steps = no fit).
+
+    Timelapse intervals are regular, so the true step motion barely varies
+    — except that a clip re-timed to another frame rate drops (or repeats)
+    frames: a dropped frame makes one step exactly twice the usual motion.
+    Such whole multiples are kept as they are (and counted in `mult`, the
+    source intervals per step); anything else far from the median is a bad
+    fit — a washed-out stretch (dawn, moonrise) loses the stars and locks
+    onto the foreground — and is filled from the neighbouring single steps.
+    Single steps are then box-smoothed over +-`smooth` of their kind."""
     n = len(steps) + 1
     steps, inl = steps.copy(), inl.copy()
     good = ~np.isnan(steps[:, 0, 0])
+    mult = np.ones(n - 1, int)
     if good.any():
-        # a washed-out stretch (dawn, moonrise) loses the stars and the fit
-        # locks onto the static foreground; regular intervals mean the true
-        # step motion barely varies, so reject steps far from the clip median
         tmp = Track(steps=np.where(good[:, None, None], steps, np.eye(3)),
                     inliers=inl, residual_px=math.nan)
         mot = np.array([tmp.motion_px(k, w, h) for k in range(n - 1)])
         med = float(np.median(mot[good]))
-        good &= np.abs(mot - med) <= max_dev * med
+        m = np.clip(np.round(mot / max(med, 1e-9)), 1, 3).astype(int)
+        good &= np.abs(mot - m * med) <= max_dev * m * med
+        mult = np.where(good, m, 1)
         inl[~good] = 0
     if good.sum() < max(3, (n - 1) // 4):
         raise RuntimeError("sky tracking failed — too few frames with stars")
     idx = np.arange(n - 1)
     flat = steps.reshape(n - 1, 9)
+    single = good & (mult == 1)
+    src = single if single.sum() >= 2 else good
     for j in range(9):                           # fill gaps by interpolation
-        flat[~good, j] = np.interp(idx[~good], idx[good], flat[good, j])
+        flat[~good, j] = np.interp(idx[~good], idx[src], flat[src, j])
 
     if smooth > 0:
+        ones = mult == 1                         # smooth single steps together
         kern = np.ones(2 * smooth + 1) / (2 * smooth + 1)
-        padded = np.pad(flat, ((smooth, smooth), (0, 0)), mode="edge")
-        flat = np.column_stack([np.convolve(padded[:, j], kern, "valid")
-                                for j in range(9)])
+        seq = flat[ones]
+        if len(seq) > 2 * smooth:
+            padded = np.pad(seq, ((smooth, smooth), (0, 0)), mode="edge")
+            flat[ones] = np.column_stack([np.convolve(padded[:, j], kern,
+                                                      "valid")
+                                          for j in range(9)])
 
     return Track(steps=flat.reshape(n - 1, 3, 3), inliers=inl,
-                 residual_px=float(np.median(res[good])))
+                 residual_px=float(np.median(res[good])),
+                 mult=mult if (mult != 1).any() else None)
