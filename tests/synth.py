@@ -17,10 +17,12 @@ from remove_satellites.core.video import FrameWriter
 
 def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
               total_deg=12.0, n_stars=45, trail=(25, 31), seed=0,
-              drift=(0.0, 0.0), ground=0) -> dict:
+              drift=(0.0, 0.0), ground=0, lights=0) -> dict:
     """drift: per-frame (dx, dy) sky translation, i.e. a pole so far
     off-frame the motion is a pan. ground: height of a static textured band
-    along the bottom that occludes the sky like land."""
+    along the bottom that occludes the sky like land. lights: bright
+    camera-fixed points (floodlit structures, lamps), brighter and more
+    numerous than the stars if you like."""
     rng = np.random.default_rng(seed)
     cx, cy = center
     # scatter stars upstream of the drift so the field stays populated
@@ -31,6 +33,8 @@ def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
     stars = rng.uniform(lo, hi, size=(n_stars, 2))
     bright = rng.uniform(140, 255, n_stars)
 
+    lamps = rng.uniform([10, 10], [w - 10, h - 10], size=(lights, 2))
+    lamp_b = rng.uniform(200, 255, lights)
     land = np.zeros((ground, w, 3), np.uint8)
     if ground:
         land[:] = 30
@@ -50,6 +54,9 @@ def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
                 x = cx + c * dx - s * dy + drift[0] * k
                 y = cy + s * dx + c * dy + drift[1] * k
                 cv2.circle(img, (round(x), round(y)), 2,
+                           (int(b), int(b), int(b)), -1)
+            for (x, y), b in zip(lamps, lamp_b):
+                cv2.circle(img, (round(x), round(y)), 3,
                            (int(b), int(b), int(b)), -1)
             if ground:
                 img[h - ground:] = land

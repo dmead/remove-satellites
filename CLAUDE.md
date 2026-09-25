@@ -34,6 +34,11 @@ Parked ideas (trail annotation) live in
   enough moved, so a static foreground can't win RANSAC with an identity fit.
   `finalize` rejects steps whose motion is > 25% off the clip median
   (washed-out frames lock onto the foreground) and gap-fills them.
+- **Camera-fixed features are excluded before tracking** (`static_points`):
+  features found at the same pixel in frames spread across the clip are
+  dropped from every frame's detections, and the next brightest taken. A
+  floodlit foreground (rockets, buildings, lamps) otherwise fills the
+  brightest-N list and the tracker never sees the sky move.
 - **Each median window is aligned to its own centre frame** — no global
   derotation, canvas padding or re-rotation. Only ≤ 2r chained steps are
   ever composed, so chaining drift stays sub-pixel.

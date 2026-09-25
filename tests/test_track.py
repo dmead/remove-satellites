@@ -27,6 +27,23 @@ def test_track_follows_rotation(tmp_path):
     assert np.hypot(*(back[0, 0] - p0[0, 0])) < 1e-6
 
 
+def test_track_ignores_bright_camera_fixed_lights(tmp_path):
+    """Floodlit structures and lamps can be brighter and more numerous than
+    the stars; tracking must still follow the sky, not them."""
+    clip = tmp_path / "lit.mp4"
+    make_clip(clip, n=40, center=(500.0, 360.0), total_deg=12.0, trail=None,
+              n_stars=60, lights=400)
+    tr = track.estimate(clip, max_stars=300)
+    p0 = np.array([[[200.0, 150.0]]])
+    k = 12
+    ang = np.radians(12.0) * k / 39
+    c, s = np.cos(ang), np.sin(ang)
+    dx, dy = 200.0 - 500.0, 150.0 - 360.0
+    truth = (500 + c * dx - s * dy, 360 + s * dx + c * dy)
+    got = cv2.perspectiveTransform(p0, tr.between(0, k))[0, 0]
+    assert np.hypot(*(got - truth)) < 1.5
+
+
 def test_far_pole_pan_is_cleaned(tmp_path):
     """Pole at infinity (pure pan): the case the pole + rate model can't fit."""
     clip = tmp_path / "pan.mp4"

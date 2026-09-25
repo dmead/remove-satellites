@@ -132,11 +132,44 @@ def _step(g0: np.ndarray, g1: np.ndarray, pts: np.ndarray,
     return h / h[2, 2], int(inl.sum()), float(np.median(r))
 
 
+def static_points(path, *, samples: int = 5, max_points: int = 3000,
+                  tol: float = 1.5) -> np.ndarray:
+    """Camera-fixed features, (N, 2): points detected at the same pixel in
+    frames spread across the clip, by which time the sky has moved on.
+
+    A floodlit building, lamps or lit trees can outshine and outnumber the
+    stars; left in, they fill the brightest-N list and pull the homography
+    to the identity. A feature counts as fixed when it shows up within
+    `tol` px in at least half of the other sampled frames."""
+    from scipy.spatial import cKDTree
+    n = video.probe(path).frame_count
+    ks = np.unique(np.linspace(0, n - 1, samples).astype(int))
+    if len(ks) < 3:
+        return np.empty((0, 2))
+    dets = [stars.detect(video.read_frame(path, int(k)),
+                         max_stars=max_points)[:, :2] for k in ks]
+    trees = [cKDTree(d) if len(d) else None for d in dets]
+    out = []
+    for i, d in enumerate(dets):
+        if not len(d):
+            continue
+        hits = np.zeros(len(d), int)
+        for j, t in enumerate(trees):
+            if j != i and t is not None:
+                hits += t.query(d, distance_upper_bound=tol)[0] < tol
+        out.append(d[hits >= (len(dets) - 1) / 2])
+    return np.vstack(out) if out else np.empty((0, 2))
+
+
 def _steps_chunk(path, a: int, b: int, max_stars: int, ransac_px: float,
-                 min_inliers: int):
+                 min_inliers: int, static=None, static_px: float = 4.0):
     """Raw fits for steps a..b-1 (needs frames a..b), read sequentially.
+    Detections within `static_px` of a camera-fixed point (`static`) are
+    dropped and the next brightest taken instead.
 
     Module-level so worker processes can import it."""
+    from scipy.spatial import cKDTree
+    fixed = cKDTree(static) if static is not None and len(static) else None
     m = b - a
     steps = np.full((m, 3, 3), np.nan)
     inl = np.zeros(m, int)
@@ -150,7 +183,12 @@ def _steps_chunk(path, a: int, b: int, max_stars: int, ransac_px: float,
                 steps[i - 1], inl[i - 1], res[i - 1] = h, ni, r
         prev_g = g
         if i < m:                                  # last frame: target only
-            prev_pts = stars.detect(frame, max_stars=max_stars)[:, :2]
+            if fixed is None:
+                prev_pts = stars.detect(frame, max_stars=max_stars)[:, :2]
+            else:
+                pts = stars.detect(frame, max_stars=max_stars + fixed.n)[:, :2]
+                d, _ = fixed.query(pts, distance_upper_bound=static_px)
+                prev_pts = pts[~np.isfinite(d)][:max_stars]
     return a, steps, inl, res
 
 
@@ -161,8 +199,9 @@ def estimate(path, *, max_stars: int = 800, ransac_px: float = 0.7,
     """Track sky motion between every adjacent pair of frames.
 
     Stars are detected in frame k and followed into k+1 with pyramidal LK;
-    a RANSAC homography rejects static foreground points (they don't move
-    with the sky) and mis-tracks. Steps with too few inliers are filled from
+    camera-fixed features found beforehand (`static_points`) are left out
+    of the detections, and a RANSAC homography rejects what static points
+    remain (they don't move with the sky) and mis-tracks. Steps with too few inliers are filled from
     their neighbours, as are steps whose motion is more than `max_dev` off
     the clip median (a speed-ramped clip would need this loosened). Steps
     are then box-smoothed over ±`smooth` frames —
@@ -186,7 +225,7 @@ def estimate(path, *, max_stars: int = 800, ransac_px: float = 0.7,
     if chunk is None:        # a few chunks per worker keeps progress smooth
         chunk = max(8, math.ceil((n - 1) / (workers * 4)))
     spans = [(a, min(a + chunk, n - 1)) for a in range(0, n - 1, chunk)]
-    args = (max_stars, ransac_px, min_inliers)
+    args = (max_stars, ransac_px, min_inliers, static_points(path))
     done = 0
 
     def take(r):
