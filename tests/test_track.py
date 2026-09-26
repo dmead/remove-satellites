@@ -66,6 +66,27 @@ def test_dropped_frames_are_kept_and_counted(tmp_path):
         assert np.hypot(*(got - truth)) < 1.5, k
 
 
+def test_repeated_frames_count_as_no_interval(tmp_path):
+    """A 25 fps timelapse put out at 60 fps repeats frames (7 of every 12
+    don't move): the track must still follow the sky and say which
+    capture each frame shows."""
+    clip = tmp_path / "pulldown.mp4"
+    clock = [k * 25 // 60 for k in range(72)]
+    info = make_clip(clip, center=(500.0, 360.0), total_deg=40.0,
+                     trail=None, clock=clock)
+    tr = track.estimate(clip)
+    assert np.allclose(tr.clock, info["clock"], atol=0.05)
+    n_src = info["clock"][-1] + 1
+    p0 = np.array([[[200.0, 150.0]]])
+    for k in (5, 12, 23):                  # chains like the tests above
+        ang = np.radians(40.0) * info["clock"][k] / (n_src - 1)
+        c, s = np.cos(ang), np.sin(ang)
+        dx, dy = 200.0 - 500.0, 150.0 - 360.0
+        truth = (500 + c * dx - s * dy, 360 + s * dx + c * dy)
+        got = cv2.perspectiveTransform(p0, tr.between(0, k))[0, 0]
+        assert np.hypot(*(got - truth)) < 1.5, k
+
+
 def test_far_pole_pan_is_cleaned(tmp_path):
     """Pole at infinity (pure pan): the case the pole + rate model can't fit."""
     clip = tmp_path / "pan.mp4"

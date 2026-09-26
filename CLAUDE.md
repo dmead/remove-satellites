@@ -38,6 +38,10 @@ Parked ideas (trail annotation) live in
   foreground) and gap-fills them — except whole multiples of it (a frame
   dropped by a frame-rate conversion), which are kept and counted in
   `Track.mult` / `Track.clock`. Only single steps are smoothed together.
+  A clip re-timed by repeating frames (a 25 fps timelapse put out at
+  60 fps: most steps don't move) switches to repeats mode
+  (`REPEATS_MOVING`): the usual step is measured from the steps that
+  move, a repeat counts 0 in `mult`, a blend its measured fraction.
 - **Camera-fixed features are excluded before tracking** (`static_points`):
   features found at the same pixel in frames spread across the clip are
   dropped from every frame's detections, and the next brightest taken. A

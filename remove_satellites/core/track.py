@@ -268,6 +268,9 @@ def estimate(path, *, max_stars: int = 800, ransac_px: float = 0.7,
                     smooth=smooth, max_dev=max_dev)
 
 
+REPEATS_MOVING = 0.85     # fewer steps than this moving: repeated frames
+
+
 def finalize(steps: np.ndarray, inl: np.ndarray, res: np.ndarray,
              w: int, h: int, *, smooth: int = 3,
              max_dev: float = 0.25) -> Track:
@@ -280,19 +283,40 @@ def finalize(steps: np.ndarray, inl: np.ndarray, res: np.ndarray,
     source intervals per step); anything else far from the median is a bad
     fit — a washed-out stretch (dawn, moonrise) loses the stars and locks
     onto the foreground — and is filled from the neighbouring single steps.
-    Single steps are then box-smoothed over +-`smooth` of their kind."""
+    Single steps are then box-smoothed over +-`smooth` of their kind.
+
+    A clip re-timed by repeating frames (a 25 fps timelapse put out at
+    60 fps) is mostly steps that don't move at all: the usual step is then
+    measured from the steps that do, a repeat counts as no interval
+    (`mult` 0), and a step between (a blended frame) keeps its fit and its
+    measured fraction of an interval (`mult` then fractional)."""
     n = len(steps) + 1
     steps, inl = steps.copy(), inl.copy()
     good = ~np.isnan(steps[:, 0, 0])
+    fitted = good.copy()
     mult = np.ones(n - 1, int)
     if good.any():
         tmp = Track(steps=np.where(good[:, None, None], steps, np.eye(3)),
                     inliers=inl, residual_px=math.nan)
         mot = np.array([tmp.motion_px(k, w, h) for k in range(n - 1)])
         med = float(np.median(mot[good]))
-        m = np.clip(np.round(mot / max(med, 1e-9)), 1, 3).astype(int)
-        good &= np.abs(mot - m * med) <= max_dev * m * med
-        mult = np.where(good, m, 1)
+        moving = mot[good] > 0.3 * np.percentile(mot[good], 90)
+        repeats = moving.mean() < REPEATS_MOVING
+        if repeats:
+            med = float(np.median(mot[good][moving]))
+        r = mot / max(med, 1e-9)
+        m = np.clip(np.round(r), 0 if repeats else 1, 3).astype(int)
+        good &= np.abs(mot - m * med) <= max_dev * np.maximum(m, 1) * med
+        if repeats:
+            # only a blend (a step between a quarter and three quarters of
+            # an interval) is fractional; the rest are whole intervals, and
+            # every fit is kept (failed ones fill as usual)
+            blend = fitted & (r >= 0.25) & (r < 0.75)
+            mult = np.where(blend, r, np.clip(np.round(r), 0, 3))
+            mult = np.where(fitted, mult, 1.0)
+            good = fitted
+        else:
+            mult = np.where(good, m, 1)
         inl[~good] = 0
     if good.sum() < max(3, (n - 1) // 4):
         raise RuntimeError("sky tracking failed — too few frames with stars")

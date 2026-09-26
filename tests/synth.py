@@ -17,15 +17,19 @@ from remove_satellites.core.video import FrameWriter
 
 def make_clip(path, *, n=60, w=640, h=480, center=(500.0, 360.0),
               total_deg=12.0, n_stars=45, trail=(25, 31), seed=0,
-              drift=(0.0, 0.0), ground=0, lights=0, drop=0) -> dict:
+              drift=(0.0, 0.0), ground=0, lights=0, drop=0,
+              clock=None) -> dict:
     """drift: per-frame (dx, dy) sky translation, i.e. a pole so far
     off-frame the motion is a pan. ground: height of a static textured band
     along the bottom that occludes the sky like land. lights: bright
     camera-fixed points (floodlit structures, lamps), brighter and more
     numerous than the stars if you like. drop: a source frame is skipped
     after every `drop` output frames, as a frame-rate conversion does
-    (returned `clock`: each output frame's source index)."""
-    clock = [k + (k // drop if drop else 0) for k in range(n)]
+    (returned `clock`: each output frame's source index). clock: each
+    output frame's source index, given (repeats allowed; overrides n)."""
+    if clock is None:
+        clock = [k + (k // drop if drop else 0) for k in range(n)]
+    n = len(clock)
     n_src = clock[-1] + 1
     rng = np.random.default_rng(seed)
     cx, cy = center
